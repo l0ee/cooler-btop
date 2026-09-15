@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from textual.widgets import Footer
+
 from cooler_btop.data import DataCollector, build_process_tree, prepare_processes
 from cooler_btop.main import BtopCloneApp
 from cooler_btop.ui import HelpModal, ProcDetailsModal, TerminateModal
@@ -175,6 +177,13 @@ class ProcessOrderingTests(unittest.TestCase):
 
 
 class TerminalPilotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_footer_stays_compact_without_command_palette(self):
+        app = self.make_app(show_pet=False)
+        async with app.run_test(size=(80, 24)):
+            footer = app.query_one(Footer)
+            self.assertTrue(footer.compact)
+            self.assertFalse(footer.show_command_palette)
+
     async def test_cpu_widget_labels_cores_with_collector_ids(self):
         app = self.make_app(show_pet=False)
         app.collector.snapshot['cpu'].update(

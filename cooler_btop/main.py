@@ -214,7 +214,9 @@ class BtopCloneApp(App):
         self.filter_input = Input(placeholder="Filter name / command / user / PID   Enter apply / Esc clear", id="filter-input")
         self.filter_input.border_title = "PROCESS FILTER / Enter apply / Esc clear"
         yield self.filter_input
-        yield Footer(compact=True, show_command_palette=False)
+        footer = Footer(show_command_palette=False)
+        footer.compact = True
+        yield footer
 
     def on_mount(self) -> None:
         self._set_layout(self.size.width)

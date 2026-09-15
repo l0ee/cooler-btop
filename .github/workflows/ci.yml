@@ -1,0 +1,108 @@
+name: Cooler btop CI
+
+"on":
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: read
+
+jobs:
+  python-package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.9", "3.14" ]
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install package and test dependencies
+      run: python -m pip install . tomli PyYAML 'setuptools>=61' wheel
+
+    - name: Run unit tests
+      run: |
+        version=$(python -c 'import importlib.metadata; print(importlib.metadata.version("cooler-btop"))')
+        make test PYTHON=python VERSION="$version"
+
+    - name: Build wheel and source distribution
+      run: |
+        version=$(python -c 'import importlib.metadata; print(importlib.metadata.version("cooler-btop"))')
+        make distributions PYTHON=python VERSION="$version"
+
+    - name: Inspect distribution artifacts
+      run: |
+        test -f dist/cooler_btop-2.0.0-py3-none-any.whl
+        test -f dist/cooler_btop-2.0.0.tar.gz
+
+    - name: Smoke test installed wheel outside source
+      run: |
+        wheel=$(realpath dist/cooler_btop-2.0.0-py3-none-any.whl)
+        smoke_dir=$(mktemp -d)
+        python -m venv "$smoke_dir/venv"
+        cd "$smoke_dir"
+        "$smoke_dir/venv/bin/python" -m pip install "$wheel"
+        "$smoke_dir/venv/bin/cooler-btop" --version
+
+  fedora-release:
+    runs-on: ubuntu-latest
+    container: fedora:44
+
+    steps:
+    - name: Install Fedora build dependencies
+      run: |
+        dnf --assumeyes --setopt=install_weak_deps=False install \
+          appstream \
+          cpio \
+          desktop-file-utils \
+          git \
+          make \
+          pyproject-rpm-macros \
+          python3-devel \
+          python3-pip \
+          python3-psutil \
+          python3-pyyaml \
+          python3-requests \
+          python3-rich \
+          python3-setuptools \
+          python3-textual \
+          python3-wheel \
+          rpm-build
+
+    - uses: actions/checkout@v5
+
+    - name: Build and validate release artifacts
+      run: make release
+
+    - name: Verify release checksums
+      run: cd dist && sha256sum --check SHA256SUMS
+
+    - name: Confirm package was not installed
+      run: |
+        set +e
+        query_output=$(LC_ALL=C rpm -q cooler-btop 2>&1)
+        query_status=$?
+        set -e
+        test "$query_status" -eq 1
+        test "$query_output" = "package cooler-btop is not installed"
+
+    - name: Upload Fedora release artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: fedora-44-release-files
+        path: |
+          dist/cooler-btop-2.0.0-1.fc44.noarch.rpm
+          dist/cooler-btop-2.0.0-1.fc44.src.rpm
+          dist/cooler_btop-2.0.0-py3-none-any.whl
+          dist/cooler_btop-2.0.0.tar.gz
+          dist/SHA256SUMS
+        if-no-files-found: error
+        retention-days: 7

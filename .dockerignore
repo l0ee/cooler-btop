@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+continuous_runner.log
+.git/
+.github/
+docs/
+packaging/
+RESEARCH_*.md
+OPTIMIZATION_LOG.md
+TASKS.md

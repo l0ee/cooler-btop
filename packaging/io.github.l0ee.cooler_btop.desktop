@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Cooler btop
+Comment=Monitor Linux system resources in a terminal
+Exec=cooler-btop --desktop
+TryExec=cooler-btop
+Icon=io.github.l0ee.cooler_btop
+Terminal=true
+Categories=System;Monitor;
+Keywords=system;monitor;cpu;memory;processes;terminal;
+StartupNotify=false

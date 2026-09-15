@@ -1,0 +1,51 @@
+.TH COOLER-BTOP 1 "2026-09-13" "cooler-btop 2.0.0" "User Commands"
+.SH NAME
+cooler-btop \- monitor Linux system resources in a terminal
+.SH SYNOPSIS
+.B cooler-btop
+.RI [ options ]
+.SH DESCRIPTION
+.B cooler-btop
+shows CPU, memory, storage, network, GPU, IPv4 TCP listening-port, and process telemetry in a Textual terminal interface.
+The web server is started only when
+.B \-\-daemon
+or
+.B \-\-serve
+is supplied.
+.SH OPTIONS
+.TP
+.B \-\-desktop
+Use application-menu error handling. If startup fails in an interactive
+terminal, display the error and wait for Enter before closing the window.
+.TP
+.BR \-\-daemon , " " \-\-serve
+Run the local web dashboard and metrics API instead of the terminal interface.
+.TP
+.BR \-\-host " " HOST
+Set the web server bind address. The default is 127.0.0.1.
+.TP
+.BR \-\-port " " PORT
+Set the web server port. The default is 8080.
+.TP
+.BR \-\-log-db " " PATH
+Write daemon metrics to the specified SQLite database.
+.TP
+.BR \-\-interval " " SECONDS
+Set the telemetry update interval. The default is 1.0 second.
+.TP
+.B \-\-no-pet
+Disable the animated terminal pet.
+.TP
+.B \-\-status
+Query the local daemon and print a short status report.
+.TP
+.B \-\-version
+Print the installed version and exit.
+.TP
+.B \-h, \-\-help
+Show command-line help and exit.
+.SH FILES
+The application does not create a system service or start a background daemon during installation.
+.SH SEE ALSO
+.BR ps (1),
+.BR top (1)

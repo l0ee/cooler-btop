@@ -1,0 +1,264 @@
+# Generated Task Ideas
+
+These entries are unapproved ideas, may duplicate behavior that has already shipped, and are not release requirements.
+
+- [ ] Add an interface in the TUI to browse and explore historical metrics stored in the SQLite database without requiring the web dashboard.
+- [ ] Implement support for grouping processes by their controlling user ID (UID) in the TUI DataTable.
+- [ ] Create a feature to periodically benchmark memory read/write speeds and log the results to detect underlying hardware performance degradation.
+- [ ] Implement an alert trigger when specific mount points reach zero available inodes.
+- [ ] Add support to track GPU memory utilization specifically for Intel GPUs using `intel_gpu_top` wrappers.
+- [ ] Create an interactive diagnostic mode in the CLI that checks for required permissions and kernel capabilities before launching the daemon.
+- [ ] Implement an option to mask out all numeric values in the TUI, replacing them with generic placeholders for taking clean screenshots.
+- [ ] Add support to parse `/proc/uptime` and visually present the idle time percentage on the main dashboard.
+- [ ] Introduce a simple CLI command `cooler-btop export` to instantly dump the current SQLite database to a CSV file without starting the web server.
+- [ ] Add an interface in the TUI to filter active network connections by a specific process name.
+- [ ] Introduce a simple CLI wizard to bootstrap a systemd unit file for the telemetry daemon.
+- [ ] Add an API endpoint to serve basic static documentation generated from the project's README.
+- [ ] Implement an alert trigger when specific environment variables change in monitored processes.
+- [ ] Add support to parse `/proc/net/dev` for custom network interface names (e.g. `wg0`, `tun0`).
+- [ ] Add support to parse `/proc/cgroups` to display currently active control group subsystems and their hierarchy.
+- [ ] Create a feature that allows users to export the current network connections list to a CSV file.
+- [ ] Implement an option to mask out sensitive command line arguments in the process list.
+- [ ] Develop an interactive CLI wizard to configure SMTP settings for email alerts.
+- [ ] Integrate a feature to automatically restart the system telemetry daemon if a crash is detected by systemd.
+- [ ] Add support to parse `/proc/vmstat` to visualize memory paging statistics in the TUI.
+- [ ] Add an overlay in the TUI to visualize the system page faults (major/minor) over time.
+- [ ] Implement a CLI tool to display system telemetry data in a raw, unformatted table for easy piping to other CLI tools.
+- [ ] Introduce an endpoint `/api/metrics/processes` to fetch only the process list without the rest of the telemetry payload.
+- [ ] Create an API endpoint to query active user sessions via `utmp`/`wtmp`.
+- [ ] Add support to parse `/sys/class/thermal/` to monitor zone temperatures across the system.
+- [ ] Introduce a feature to aggregate and visualize network traffic by subnet (e.g. 192.168.1.0/24).
+- [ ] Introduce a mechanism to alert users if the system time drifts significantly from NTP servers.
+- [ ] Implement an option to track and display total number of active file handles per user in the TUI.
+- [ ] Create a feature that visually flags processes that have been running for more than a configured duration (e.g. 30 days).
+- [ ] Add an interface in the web dashboard to monitor the status of ongoing database backups.
+- [ ] Create an endpoint that exports system performance data directly in Prometheus format without requiring a separate exporter.
+- [ ] Add an interactive tool to dynamically adjust TUI color themes using a hex-code palette.
+- [ ] Implement support for grouping processes by their controlling user session (session ID).
+- [ ] Create an API endpoint to query currently running virtual machines via `libvirt` or similar, if present.
+- [ ] Add a visual overlay for tracking `iowait` spikes over time across all CPU cores.
+- [ ] Implement an option to track and display total number of context switches per process.
+- [ ] Create an API endpoint to return the current kernel panic configuration and uptime.
+- [ ] Add a visual overlay for block device queue depths in the TUI to identify I/O bottlenecks.
+- [ ] Implement an overlay displaying the number of active file descriptors (`/proc/sys/fs/file-nr`) and its limit.
+- [ ] Add an endpoint to retrieve the list of loaded kernel modules (`/proc/modules`).
+- [ ] Introduce support to parse `/proc/buddyinfo` to show memory fragmentation statistics visually.
+- [ ] Implement an alert trigger when specific IP addresses or subnets are detected in the active network connections.
+- [ ] Allow grouping processes by their container ID (Docker/Podman) in the TUI DataTable.
+- [ ] Create a feature that displays the top 5 largest directories on the root filesystem in the disk widget.
+- [ ] Add support to parse `/sys/class/net/` to distinguish between physical and virtual network interfaces.
+- [ ] Implement an automated dependency license checker in the CI/CD pipeline to ensure compliance.
+- [ ] Introduce an option in the UI to scale text size dynamically for better accessibility.
+- [ ] Create an API endpoint to retrieve all collected system metrics over the last 24 hours grouped by hour.
+- [ ] Implement an overlay in the TUI to visualize the system page cache eviction rates.
+- [ ] Add support to parse `/proc/schedstat` to display CPU scheduler latency statistics.
+- [ ] Implement support for parsing `/proc/net/snmp` to track global SNMP metrics like IP/TCP/UDP error counts.
+- [ ] Add an interactive process renice/priority change feature directly from the TUI DataTable.
+- [ ] Introduce a simple CLI command `cooler-btop benchmark` to run a localized Python CPU/Memory stress test.
+- [ ] Create an API endpoint to retrieve basic network interface statistics (rx/tx bytes and packets) independently of the full dump.
+- [ ] Add an option in the UI to display raw byte values instead of human-readable formats (e.g., 1048576 instead of 1.0M).
+- [ ] Implement an alert trigger when the system load average exceeds the number of available CPU cores.
+- [ ] Add an interface in the web dashboard to easily download raw SQLite `.db` backups directly.
+- [ ] Introduce a simple feature to capture and export the current state of all TUI panels to a text file.
+- [ ] Allow specifying multiple custom config file paths via an environment variable `COOLER_CONFIG_PATH`.
+- [ ] Implement an option to mask or hash command line arguments in the process list for security compliance.
+- [ ] Create a feature to periodically ping external endpoints and display the latency in the dashboard.
+- [ ] Add support to parse `/proc/mdstat` for software RAID status monitoring.
+- [ ] Add support to parse `/proc/locks` to display current file locks in a new TUI widget.
+- [ ] Implement an alert trigger when specific system partitions are unmounted unexpectedly.
+- [ ] Introduce a simple CLI argument to format the output of `cooler-btop dump` in YAML instead of JSON.
+- [ ] Add support to parse `/proc/swaps` to display priority and size of each active swap area in the TUI.
+- [ ] Implement an option to restrict the telemetry dashboard API strictly to localhost for security.
+- [ ] Introduce a feature to aggregate and display disk usage statistics across all containers (Docker/Podman).
+- [ ] Add an endpoint `/api/metrics/summary` to return only aggregate CPU, Memory, and Disk stats for faster polling.
+- [ ] Add an option in the UI to change the temperature unit between Celsius and Fahrenheit.
+- [ ] Support exporting the current state of processes as a plain text file directly from the TUI.
+- [ ] Allow expanding the TUI network pane to show TCP and UDP stats side-by-side.
+- [ ] Provide an endpoint to download a comprehensive JSON dump of the system topology (CPU layout, NUMA nodes, mounted disks).
+- [ ] Implement an ASCII graph widget for memory usage history in the terminal.
+- [ ] Add support to parse `/proc/zoneinfo` for detailed memory zone fragmentation statistics.
+- [ ] Implement a dynamic process grouping feature by executable name in the TUI to aggregate CPU/Memory.
+- [ ] Create a feature to periodically benchmark disk write speeds and log the results.
+- [ ] Create a feature that enables users to visually construct and test custom alert conditions using a drag-and-drop interface in the web dashboard.
+- [ ] Add a CLI argument to specify a custom path for the configuration file.
+- [ ] Implement support for parsing network namespace specific metrics for containerized applications.
+- [ ] Create a feature to customize the AnimePetWidget animation speed.
+- [ ] Implement support for reading battery health and charge status for laptops in the TUI.
+- [ ] Add an interface in the TUI to manually drop pagecache, dentries, and inodes (requires root).
+- [ ] Add support to parse `/proc/interrupts` for detailed IRQ counts per CPU in the TUI.
+- [ ] Implement a command line argument `--no-ui` to run the agent headlessly and just serve metrics on the API.
+- [ ] Implement an automated feature to check for newer versions of the tool on GitHub and display an update notification.
+- [ ] Develop an endpoint in the API to query active listening ports and their associated processes.
+- [ ] Add an overlay for visualizing detailed CPU cache (L1/L2/L3) usage using `perf` counters.
+- [ ] Allow grouping processes by their controlling terminal (TTY) in the TUI DataTable.
+- [ ] Implement a command line argument to restrict the telemetry collection to a specific namespace or cgroup.
+- [ ] Add support to parse `/proc/slabinfo` to display kernel slab cache usage.
+- [ ] Implement a "focus mode" in the TUI that expands a single selected panel to full screen.
+- [ ] Create a feature to allow sharing a read-only snapshot of the TUI dashboard via a unique URL.
+- [ ] Add support to parse `/proc/meminfo` for detailed HugePages and Vmalloc usage statistics in the TUI.
+- [ ] Implement a command palette (invoked via `Ctrl+P`) in the TUI for quick navigation between metric panels.
+- [ ] Add an option in the configuration to specify custom process names that should always be pinned to the top of the TUI list.
+- [ ] Implement an overlay in the TUI displaying overall system energy usage if `RAPL` or `/sys/class/powercap/` is available.
+- [ ] Create a feature to save the current TUI state (sort order, active tab) and restore it on the next run.
+- [ ] Implement an alert trigger when CPU temperature exceeds a configurable maximum threshold.
+- [ ] Add an interface in the TUI to view detailed process environment variables for a selected PID.
+- [ ] Introduce a feature to filter processes in the TUI based on their memory consumption exceeding a specific value.
+- [ ] Implement support for customizing the TUI layout using a YAML configuration file.
+- [ ] Add an interactive visual tour on first launch to explain the UI panels and shortcuts.
+- [ ] Provide an option to mute all alerts globally via a CLI flag or TUI toggle.
+- [ ] Add support to parse `/proc/stat` for detailed IRQ and SoftIRQ counters in the TUI.
+- [ ] Introduce a simple CLI command `cooler-btop dump` to quickly print current JSON metrics without starting the server.
+- [ ] Create a web dashboard widget that visualizes active TCP connection states as a pie chart.
+- [ ] Add a CLI flag to export the SQLite database schema as a `.sql` file.
+- [ ] Add support to monitor system fan speeds alongside CPU temperatures.
+- [ ] Implement an API endpoint that provides health check status of all configured alert integrations.
+- [ ] Add an interface in the web dashboard to edit configuration parameters dynamically.
+- [ ] Add a CLI argument `--port` to quickly change the web dashboard port without editing the config file.
+- [ ] Implement an alert trigger when specific system services (e.g., `sshd`, `cron`) fail or stop.
+- [ ] Add an interface in the web dashboard to export full database metrics as a CSV archive.
+- [ ] Implement an optional telemetry opt-in that sends anonymized usage stats to a central server.
+- [ ] Create a feature that allows users to define custom shell commands to be run when an alert is triggered.
+- [ ] Implement an integration to export active alerts to PagerDuty.
+- [ ] Add a `pyproject.toml` script entry point so the tool can be run globally via `cooler-btop` command.
+- [ ] Add support to monitor network interface errors (drop/err) alongside traffic in the TUI.
+- [ ] Add an option in the TUI to temporarily hide processes owned by `root`.
+- [ ] Add support to monitor GPU temperatures specifically for AMD GPUs via `hwmon`.
+- [ ] Create an API endpoint returning basic system host information (OS, kernel version, architecture).
+- [ ] Introduce a standalone script to migrate legacy metrics data to the new SQLite schema.
+- [ ] Add a CLI flag to override the default SQLite database path.
+- [ ] Implement a basic HTTP basic authentication middleware for the web dashboard.
+- [ ] Build a custom CLI parser to query running processes by memory usage directly from the terminal.
+- [ ] Add an interface in the web dashboard to visualize system events and logs in a timeline format.
+- [ ] Introduce a feature to pause all background metric polling to temporarily save CPU cycles.
+- [ ] Create an endpoint to export all active network connections in CSV format.
+- [ ] Add a compact overview dashboard suitable for small embedded displays (e.g. Raspberry Pi 3.5" LCD).
+- [ ] Provide a configuration option to whitelist or blacklist specific mount points from disk metrics.
+- [ ] Create a CLI tool to clear the SQLite metrics database.
+- [ ] Add a compact 'mini' mode for the web dashboard that displays only key metrics.
+- [ ] Add an optional feature to upload logs to an S3 bucket on a schedule.
+- [ ] Support generating an HTML report of historical memory usage over a specified time range.
+- [ ] Add an interface in the TUI to browse and restore from SQLite database backups.
+- [ ] Add a CLI option to immediately drop all tables and reset the SQLite database.
+- [ ] Implement a user authentication system for the web dashboard utilizing OAuth2.
+- [ ] Add an interface in the TUI to visually configure and test regex-based log parsing rules.
+- [ ] Provide support for customizing the AnimePetWidget with different ASCII art characters from a configuration file.
+- [ ] Create a CLI tool to query the metrics database from the terminal.
+- [ ] Add a compact 'mini' mode for the TUI that only displays the top 5 CPU consuming processes.
+- [ ] Implement support for exporting logs to syslog on Linux systems.
+- [ ] Implement support for exporting metrics to InfluxDB for long-term storage and Grafana visualization.
+- [ ] Add a visual overlay displaying top network consumers (processes) in the TUI.
+- [ ] Introduce a simple CLI argument to run the agent in background daemon mode.
+- [ ] Implement an alert trigger when memory swap usage is consistently high for over 5 minutes.
+- [ ] Add a summary statistics panel in the TUI displaying total number of threads across all processes.
+- [ ] Create a `docker-compose.yaml` file specifically configured for development with hot-reloading enabled.
+- [ ] Implement an alert trigger when specific critical processes (e.g., `nginx`, `docker`) go down.
+- [ ] Add an interface to view and terminate orphaned child processes in the TUI.
+- [ ] Add a visual overlay for network packet loss statistics over time.
+- [ ] Implement support for parsing custom regex patterns in logs to track application-specific metrics.
+- [ ] Add an interface to configure custom alert thresholds directly from the web dashboard.
+- [ ] Implement an automated weekly summary report generated as a static HTML page.
+- [ ] Implement an automated dependency vulnerability scan using `pip-audit` in a new Makefile target.
+- [ ] Add an interface in the web dashboard to trigger a manual garbage collection cycle in the data collector.
+- [ ] Add support for reading disk I/O metrics via `/proc/diskstats` as a fallback mechanism.
+- [ ] Implement an alert trigger when memory swap usage exceeds 80%.
+- [ ] Add support for detecting and highlighting processes with memory leaks based on continuous growth.
+- [ ] Provide an API endpoint to download a snapshot of the current state of the entire system as a zip archive.
+- [ ] Implement an alert threshold for high zombie process count in the system.
+- [ ] Add support for detecting and highlighting cryptocurrency mining processes based on heuristics.
+- [ ] Create a separate script to easily install the tool as a system service.
+- [ ] Implement an automated dependency update check script that runs monthly.
+- [ ] Add an interface in the TUI to manually adjust the data polling rate on the fly.
+- [ ] Add CPU temperature per-core tracking in the TUI if the hardware supports it.
+- [ ] Implement a system load average visualization graph for 1m, 5m, and 15m intervals in the TUI.
+- [ ] Add support for reading SMART disk health data and displaying warning flags in the TUI disk pane.
+- [ ] Implement a network interface selection dropdown in the web dashboard to isolate metrics to a specific adapter.
+- [ ] Implement an automated stress-test suite in a separate script to benchmark the data collector under high load.
+- [ ] Add a visual breakdown of disk usage per mount point in a dedicated TUI widget.
+- [ ] Expose an API endpoint to retrieve the current status of all mounted filesystems.
+- [ ] Implement an automated daily backup mechanism for the SQLite metrics database.
+- [ ] Add support for displaying thermal throttling events as notifications in the TUI.
+- [ ] Introduce a simple plugin architecture to easily load external Python scripts for custom dashboards.
+- [ ] Implement an alert threshold for high disk space usage, displaying a warning in the TUI when >90%.
+- [ ] Add an interface in the web dashboard to forcefully kill processes via PID.
+- [ ] Implement a history tracking feature for the highest CPU-consuming processes over the last 24 hours.
+- [ ] Implement an OOM-killer alert widget in the TUI to notify if any processes were recently terminated by the kernel.
+- [ ] Add support for reading hardware sensor metrics via `sensors` command output if `/sys/class/hwmon` is unavailable.
+- [ ] Introduce a simple HTTP-based remote control API to pause/resume the telemetry agent from the web dashboard.
+- [ ] Implement an alert webhook integration to send notifications to Slack or Discord.
+- [ ] Add a visual overlay for GPU VRAM usage in the TUI, separated by process if possible.
+- [ ] Introduce a plugin system allowing users to add custom data collectors (e.g. for specific application metrics).
+- [ ] Implement an integration with Prometheus by adding a `/metrics` endpoint to the web server.
+- [ ] Add a visual overlay for disk I/O activity showing a graph of read/write speeds over time in the TUI.
+- [ ] Introduce a rate limiter to the API endpoints to prevent abuse.
+- [ ] Implement a custom logging handler to stream logs directly to the TUI dashboard.
+- [ ] Add a `Dockerfile.alpine` specifically for a minimal footprint container deployment.
+- [ ] Add a visual overlay for CPU frequency scaling and governor states in the TUI.
+- [ ] Implement support for parsing custom log files to display recent application errors in a new TUI widget.
+- [ ] Add an option to collapse/expand specific metric panels in the TUI to save screen space.
+- [ ] Support generating PDF reports of system metrics over a specified time range.
+- [ ] Implement an alert notification via desktop popups using `notify-send` on Linux.
+- [ ] Add a visual overlay for network throughput showing an active graph over the last hour.
+- [ ] Configure GitHub Actions to automatically run the UI unit tests on every push.
+- [ ] Implement a WebSockets endpoint in `server.py` to stream live metrics to the dashboard without polling.
+- [ ] Add an export button to the TUI to save current metrics as a JSON file.
+- [ ] Build a simple `Makefile` target for running linters and formatters (e.g. `flake8`, `black`).
+- [ ] Implement support for macOS specific metrics (e.g., reading from `sysctl` instead of `/proc`).
+- [ ] Add an interactive command-line helper script to generate the default configuration file.
+- [ ] Add CPU usage percentage sparkline graphs next to each process in the TUI DataTable.
+- [ ] Implement an automatic database cleanup job to prune SQLite records older than 30 days.
+- [ ] Add a command line argument (`--version`) to print the current application version and exit.
+- [ ] Introduce a logging retention policy configurable via environment variables.
+- [ ] Implement a system configuration screen in the TUI to edit settings dynamically without editing the config file directly.
+- [ ] Add network bandwidth usage sparklines (graphs) for the last 60 seconds in the TUI.
+- [ ] Integrate a basic port scanner feature in the network connections tab.
+- [ ] Implement a configuration option to set the default sorting column and direction in the TUI process table.
+- [ ] Add a visual CPU load graph widget to the web dashboard.
+- [ ] Support custom color themes (e.g. monokai, dracula) for the Textual TUI via configuration.
+- [ ] Implement a process tree view in the TUI to show parent-child relationships.
+- [ ] Add a search bar to quickly find processes by name or PID in the TUI.
+- [ ] Create a systemd service file template for running the web dashboard automatically on boot.
+- [ ] Add support for filtering network connections by state (ESTABLISHED, LISTEN, etc.) in the TUI.
+- [ ] Implement an API endpoint to retrieve the last N minutes of historical metrics.
+- [ ] Add CPU core individual usage bars in the TUI instead of just aggregate usage.
+- [ ] Add a dark/light mode toggle for the web dashboard.
+- [ ] Implement historical data retention limits for the SQLite metrics database.
+- [ ] Add a visual memory usage gauge per process in the TUI DataTable.
+- [ ] Add support for saving custom UI layouts in the Textual TUI.
+- [ ] Implement a system tray icon for desktop environments that displays summary stats.
+- [ ] Add an auto-refresh interval configuration setting for the web dashboard.
+- [ ] Implement an alert logging system to write warnings to a file when thresholds (CPU, RAM) are exceeded.
+- [ ] Add a system uptime and boot time metric to the dashboard and TUI.
+- [ ] Support filtering the process list by running user in the TUI.
+- [ ] Add a configuration file (e.g. config.yaml or config.json) for alert thresholds (CPU temp, load average, FD limit).
+- [ ] Add per-process network I/O tracking to the process table.
+- [ ] Add basic authentication (auth token check) to the web dashboard and headless JSON API endpoints.
+- [ ] Add per-process disk I/O tracking using `/proc/[pid]/io`.
+- [ ] Add mouse click support for column sorting in the Textual TUI process table.
+- [ ] Refactor `DataCollector` class into a separate `collector.py` file to keep `data.py` focused on data structures.
+- [ ] Add unit tests for the `AnimePetWidget` to ensure frame calculation does not error at various terminal widths.
+- [ ] Add an export button to the Web Dashboard to download the currently displayed process list as a CSV file.
+- [ ] Implement a multi-stage Docker build to reduce the final image size.
+- [ ] Add a `--debug` flag to `main.py` to enable detailed logging of parsing errors in `fast_telemetry.py`.
+- [ ] Add a `README_DEV.md` file documenting the developer setup and architecture layout.
+- [ ] Add an endpoint `/api/health` to `server.py` specifically for load balancer health checks.
+- [ ] Add a visual indicator in the TUI (e.g. a red blinking text) when CPU temperature exceeds 90°C.
+- [ ] Add support for parsing cgroups v2 memory limits to show container-aware memory metrics.
+- [ ] Add a visual memory gauge in the TUI representing cached vs active vs free memory.
+- [ ] Add support to track GPU memory utilization specifically for NVIDIA GPUs using `nvidia-smi` wrappers.
+- [ ] Implement a basic HTTP rate-limiting mechanism for the dashboard API using an in-memory token bucket.
+- [ ] Introduce a simple CLI command `cooler-btop health` to run a rapid diagnostic of system dependencies.
+- [ ] Create a Python script to automatically detect running database servers (MySQL/PostgreSQL) and track their specific PIDs.
+- [ ] Add support to parse `/sys/class/net/` to display physical link speeds and duplex settings in the TUI.
+- [ ] Implement an overlay displaying the count of zombie processes over time in a line graph.
+- [ ] Implement an alert trigger when network latency to a configured default gateway exceeds 100ms.
+- [ ] Add an option in the UI to display process memory size in percentages rather than absolute values.
+- [ ] Create a feature to periodically archive old SQLite `.db` metric files to gzip format to save disk space.
+- [ ] Create a specific view in the TUI to list and monitor all open sockets for a chosen PID.
+- [ ] Add support to parse `/proc/stat` to calculate and visualize context switch rate per second.
+- [ ] Implement an option to set process CPU affinity (taskset) directly from the TUI DataTable.
+- [ ] Create a feature that allows defining custom metric aliases in the configuration file to rename default labels.
+- [ ] Implement support for parsing `/proc/net/arp` to display the current ARP cache table in the dashboard.
+- [ ] Add a visual overlay for tracking `stepticks` (CPU steal time) specifically for monitoring virtual machine overhead.
+- [ ] Implement an option to export the currently loaded process tree directly into a JSON file from the TUI.
+- [ ] Create an API endpoint to query currently established network connections grouped by port number.
+- [ ] Introduce a feature in the TUI to highlight processes with high IO waits.

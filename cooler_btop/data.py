@@ -1,0 +1,665 @@
+import ipaddress
+import math
+import os
+import psutil
+import re
+import socket
+import subprocess
+import time
+from .fast_telemetry import FastTelemetry
+from collections import namedtuple
+
+SYS_PATH = os.environ.get('HOST_SYS', '/sys')
+TOPOLOGY_CACHE_SECONDS = 5.0
+NVIDIA_STALE_SECONDS = 30.0
+UUID_PATTERN = re.compile(
+    r'(?i)(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])'
+)
+MAC_PATTERN = re.compile(
+    r'(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f])'
+)
+PRIVATE_PATH_COMPONENT = re.compile(
+    r'(?i)(?:[0-9a-f]{4}-[0-9a-f]{4}|[0-9a-f]{12}|[0-9a-f]{16}|'
+    r'(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2})'
+)
+IP_CANDIDATE_PATTERN = re.compile(
+    r'(?i)(?<![0-9a-z])\[?[0-9a-f:.%]{2,}\]?(?![0-9a-z])'
+)
+IPV4_CANDIDATE_PATTERN = re.compile(
+    r'(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])'
+)
+
+
+def _read_interface_link_addresses():
+    root = os.path.join(SYS_PATH, 'class', 'net')
+    addresses = {}
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return addresses
+    for name in names:
+        try:
+            with open(os.path.join(root, name, 'address'), 'r', encoding='ascii') as stream:
+                address = stream.read().strip().casefold()
+        except OSError:
+            continue
+        if address:
+            addresses[name] = address
+    return addresses
+
+
+def _normalize_link_identity(address):
+    if not isinstance(address, str):
+        return None
+    address = address.strip().casefold()
+    if not re.fullmatch(r'(?:[0-9a-f]{2}:){5,19}[0-9a-f]{2}', address):
+        return None
+    if set(address.replace(':', '')) == {'0'}:
+        return None
+    return address
+
+
+def _address_snapshot(interface_addresses):
+    try:
+        if callable(interface_addresses):
+            return interface_addresses()
+        return interface_addresses or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _link_identity(addresses, name):
+    link_identity = addresses.get(name)
+    if not isinstance(link_identity, str):
+        link_identity = next((
+            address.address for address in link_identity or ()
+            if getattr(address, 'family', None) == psutil.AF_LINK
+            and isinstance(getattr(address, 'address', None), str)
+        ), None)
+    return _normalize_link_identity(link_identity)
+
+
+def _public_interface_name(name):
+    match = re.fullmatch(r'(enx|wlx|wwx)[0-9a-fA-F]{12}', name)
+    if not match:
+        return name
+    return {'enx': 'Ethernet', 'wlx': 'Wi-Fi', 'wwx': 'WWAN'}[match.group(1).casefold()]
+
+
+def _redact_private_tokens(value):
+    def redact_ip(match):
+        candidate = match.group(0)
+        address = candidate.strip('[]').split('%', 1)[0]
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            return candidate
+        return '[redacted]'
+
+    components = []
+    for component in str(value).split('/'):
+        if PRIVATE_PATH_COMPONENT.fullmatch(component):
+            components.append('[redacted]')
+            continue
+        component = UUID_PATTERN.sub('[redacted]', component)
+        component = MAC_PATTERN.sub('[redacted]', component)
+        component = IPV4_CANDIDATE_PATTERN.sub(redact_ip, component)
+        components.append(IP_CANDIDATE_PATTERN.sub(redact_ip, component))
+    return '/'.join(components)
+
+
+def _public_storage_source(source):
+    source = str(source)
+    if source.casefold().startswith('/dev/disk/by-'):
+        return 'Persistent device'
+    if ':' in source or source.startswith('//'):
+        return 'Network filesystem'
+    return _redact_private_tokens(source)
+
+
+def key_interface_counters(counters, interface_index, interface_addresses):
+    """Key psutil counters by the kernel identity of each interface."""
+    addresses = _address_snapshot(interface_addresses)
+    keyed = {}
+    for name, values in counters.items():
+        try:
+            link_identity = _link_identity(addresses, name)
+            identity = (name, interface_index(name), link_identity)
+        except (OSError, ValueError):
+            continue
+        keyed[identity] = values
+    return keyed
+
+
+def _sample_interface_counters(interface_index, interface_addresses):
+    addresses_before = _address_snapshot(interface_addresses)
+    indices_before = {}
+    for name in addresses_before:
+        try:
+            indices_before[name] = interface_index(name)
+        except (OSError, ValueError):
+            continue
+    counters = psutil.net_io_counters(pernic=True)
+    addresses_after = _address_snapshot(interface_addresses)
+    keyed = key_interface_counters(counters, interface_index, addresses_after)
+    stable = {}
+    for identity, values in keyed.items():
+        name, index, link_identity = identity
+        if (link_identity is None
+                or _link_identity(addresses_before, name) != link_identity
+                or indices_before.get(name) != index):
+            identity = (name, index, None)
+        stable[identity] = values
+    return stable
+
+
+def build_process_tree(processes, sort_by="cpu_percent"):
+    """Order branches by total usage while retaining each process's own metrics."""
+    process_map = {
+        p['pid']: {
+            **p,
+            'cumulative_cpu': p.get('cpu_percent') or 0,
+            'cumulative_memory': p.get('memory_percent') or 0,
+            'children': [],
+        }
+        for p in processes
+    }
+    roots = []
+    for pid, node in process_map.items():
+        ppid = node.get('ppid')
+        if ppid in process_map and ppid != pid:
+            process_map[ppid]['children'].append(node)
+        else:
+            roots.append(node)
+
+    metric = 'cumulative_memory' if sort_by == 'memory_percent' else 'cumulative_cpu'
+    order = lambda node: (-node[metric], node['pid'])
+    forest = []
+    visited = set()
+    # Iterative postorder also keeps deep trees and racing/cyclic PID snapshots usable.
+    for root in roots + list(process_map.values()):
+        if root['pid'] in visited:
+            continue
+        forest.append(root)
+        stack = [(root, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                for child in node['children']:
+                    node['cumulative_cpu'] += child['cumulative_cpu']
+                    node['cumulative_memory'] += child['cumulative_memory']
+                node['children'].sort(key=order)
+            else:
+                visited.add(node['pid'])
+                node['children'] = [c for c in node['children'] if c['pid'] not in visited]
+                stack.append((node, True))
+                stack.extend((child, False) for child in reversed(node['children']))
+
+    forest.sort(key=order)
+    result = []
+    stack = [(root, '', True, True) for root in reversed(forest)]
+    while stack:
+        node, prefix, is_last, is_root = stack.pop()
+        tree_prefix = '' if is_root else prefix + ('└─ ' if is_last else '├─ ')
+        result.append({
+            **{key: value for key, value in node.items() if key != 'children'},
+            'name': tree_prefix + str(node.get('name') or ''),
+            'tree_prefix': tree_prefix,
+        })
+        child_prefix = '' if is_root else prefix + ('   ' if is_last else '│  ')
+        children = node['children']
+        stack.extend(
+            (child, child_prefix, i == len(children) - 1, False)
+            for i, child in reversed(list(enumerate(children)))
+        )
+    return result
+
+
+def prepare_processes(processes, sort_by="cpu_percent", filter_str="", tree=False, limit=None):
+    """Present a snapshot without resampling or mutating the collector's data."""
+    query = filter_str.strip().casefold()
+    procs = [
+        p for p in processes
+        if not query or query in (
+            f"{p['pid']} {p.get('name', '')} {p.get('cmdline', '')} {p.get('username', '')}"
+        ).casefold()
+    ]
+    if tree and not query:
+        procs = build_process_tree(procs, sort_by=sort_by)
+    else:
+        procs.sort(key=lambda p: (-(p.get(sort_by) or 0), p['pid']))
+    return procs if limit is None else procs[:limit]
+
+class DataCollector:
+    def __init__(self, interface_index=socket.if_nametoindex, interface_addresses=None):
+        self._interface_index = interface_index
+        self._interface_addresses = interface_addresses or _read_interface_link_addresses
+        self._last_net_by_interface = _sample_interface_counters(
+            interface_index, self._interface_addresses,
+        )
+        self.last_time = time.monotonic()
+        self._proc_cache = {}
+        self._fast = FastTelemetry()
+
+        # Let the fast CPU parser run once to establish a baseline for deltas
+        self._fast.get_cpu_percent()
+
+    def get_cpu(self):
+        global_pct, per_core = self._fast.get_cpu_percent()
+        core_ids = list(getattr(self._fast, '_last_cpu_ids', range(len(per_core))))
+        # Fallback to psutil if /proc isn't available
+        if global_pct == 0.0 and not per_core:
+            global_pct = psutil.cpu_percent()
+            per_core = psutil.cpu_percent(percpu=True)
+            core_ids = list(range(len(per_core)))
+
+        cpu_freq = psutil.cpu_freq()
+        freq = cpu_freq.current if cpu_freq else 0
+        return {
+            "total": global_pct,
+            "per_core": per_core,
+            "core_ids": core_ids,
+            "freq": freq
+        }
+
+    def get_mem(self):
+        mem_total, mem_avail, swap_total, swap_free, buffers, cached = self._fast.get_meminfo()
+
+        if mem_total == 0:
+            # Fallback
+            mem = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+            return {"mem": mem, "swap": swap}
+
+        mem_used = mem_total - mem_avail
+        mem_pct = round((mem_used / mem_total) * 100, 1) if mem_total > 0 else 0.0
+
+        swap_used = swap_total - swap_free
+        swap_pct = round((swap_used / swap_total) * 100, 1) if swap_total > 0 else 0.0
+        mem_free = getattr(self._fast, '_last_mem_free', None)
+        if not isinstance(mem_free, (int, float)):
+            mem_free = mem_avail
+
+        # Create namedtuples matching psutil format
+        MemInfo = namedtuple('MemInfo', ['total', 'available', 'percent', 'used', 'free', 'buffers', 'cached'])
+        SwapInfo = namedtuple('SwapInfo', ['total', 'used', 'free', 'percent'])
+
+        mem = MemInfo(total=mem_total, available=mem_avail, percent=mem_pct, used=mem_used, free=mem_free, buffers=buffers, cached=cached)
+        swap = SwapInfo(total=swap_total, used=swap_used, free=swap_free, percent=swap_pct)
+
+        return {"mem": mem, "swap": swap}
+
+    def get_disk(self):
+        disks = []
+        for p in psutil.disk_partitions():
+            if 'loop' in p.device: continue
+            try:
+                usage = psutil.disk_usage(p.mountpoint)
+                disks.append({
+                    "mount": _redact_private_tokens(p.mountpoint),
+                    "device": _public_storage_source(p.device),
+                    "_device_name": os.path.basename(os.path.realpath(p.device)),
+                    "filesystem": getattr(p, 'fstype', None) or None,
+                    "total": usage.total, "used": usage.used,
+                    "free": usage.free, "percent": usage.percent,
+                })
+            except (OSError, PermissionError):
+                pass
+
+        r_io, w_io = self._fast.get_disk_io()
+        devices = self._get_disk_devices()
+        for partition in disks:
+            partition_name = partition.pop('_device_name')
+            metadata = next((
+                device for device in sorted(devices, key=lambda item: -len(item['name']))
+                if partition_name == device['name']
+                or partition_name.startswith(device['name'] + 'p')
+                or (partition_name.startswith(device['name'])
+                    and partition_name[len(device['name']):].isdigit())
+            ), None)
+            for key in ('model', 'vendor', 'type', 'capacity'):
+                partition[key] = metadata.get(key) if metadata else None
+
+        return {
+            "partitions": disks,
+            "io": {"read_bytes": r_io, "write_bytes": w_io},
+            "devices": devices,
+            "zram": self._get_zram(),
+        }
+
+    @staticmethod
+    def _read_sys_text(path):
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as stream:
+                value = stream.read().strip()
+        except OSError:
+            return None
+        return value or None
+
+    def _get_disk_devices(self):
+        now = time.monotonic()
+        cached = getattr(self, '_disk_devices_cache', None)
+        cached_at = getattr(self, '_disk_devices_cache_at', None)
+        if cached is not None and cached_at is not None and now - cached_at < TOPOLOGY_CACHE_SECONDS:
+            return cached
+        root = os.path.join(SYS_PATH, 'class', 'block')
+        devices = []
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            self._disk_devices_cache = devices
+            self._disk_devices_cache_at = now
+            return devices
+        for name in names:
+            if name.startswith(('loop', 'ram', 'zram', 'dm-')):
+                continue
+            base = os.path.join(root, name)
+            if os.path.exists(os.path.join(base, 'partition')):
+                continue
+            model = self._read_sys_text(os.path.join(base, 'device', 'model'))
+            vendor = self._read_sys_text(os.path.join(base, 'device', 'vendor'))
+            sectors = self._read_sys_text(os.path.join(base, 'size'))
+            rotational = self._read_sys_text(os.path.join(base, 'queue', 'rotational'))
+            try:
+                capacity = int(sectors) * 512 if sectors is not None else None
+            except ValueError:
+                capacity = None
+            if name.startswith('nvme'):
+                device_type = 'NVMe SSD'
+            elif rotational == '0':
+                device_type = 'SSD'
+            elif rotational == '1':
+                device_type = 'HDD'
+            else:
+                device_type = 'Block device'
+            devices.append({
+                'name': name, 'model': model, 'vendor': vendor,
+                'type': device_type, 'capacity': capacity,
+            })
+        self._disk_devices_cache = devices
+        self._disk_devices_cache_at = now
+        return devices
+
+    def _get_zram(self):
+        root = os.path.join(SYS_PATH, 'block')
+        zram = []
+        try:
+            names = sorted(name for name in os.listdir(root) if name.startswith('zram'))
+        except OSError:
+            return zram
+        for name in names:
+            fields = self._read_sys_text(os.path.join(root, name, 'mm_stat'))
+            if not fields:
+                continue
+            try:
+                values = [int(value) for value in fields.split()]
+            except ValueError:
+                continue
+            if len(values) < 3:
+                continue
+            memory_limit = values[3] if len(values) > 3 and values[3] > 0 else None
+            zram.append({
+                'name': name, 'original_bytes': values[0],
+                'compressed_bytes': values[1], 'memory_bytes': values[2],
+                'limit_bytes': memory_limit,
+            })
+        return zram
+
+    def get_net(self):
+        current_time = time.monotonic()
+        dt = current_time - self.last_time
+        interface_index = getattr(self, '_interface_index', socket.if_nametoindex)
+        current = _sample_interface_counters(
+            interface_index, getattr(self, '_interface_addresses', None),
+        )
+        try:
+            link_stats = psutil.net_if_stats()
+        except (OSError, AttributeError):
+            link_stats = {}
+        previous = getattr(self, '_last_net_by_interface', {})
+        interfaces = []
+        for identity, counters in sorted(current.items()):
+            name = identity[0]
+            if name == 'lo':
+                continue
+            old = previous.get(identity)
+            down = 0
+            up = 0
+            if old is not None and identity[2] is not None and dt > 0:
+                if counters.bytes_recv >= old.bytes_recv:
+                    down = (counters.bytes_recv - old.bytes_recv) / dt
+                if counters.bytes_sent >= old.bytes_sent:
+                    up = (counters.bytes_sent - old.bytes_sent) / dt
+            stats = link_stats.get(name)
+            speed = getattr(stats, 'speed', None)
+            mtu = getattr(stats, 'mtu', None)
+            interfaces.append({
+                "name": _public_interface_name(name),
+                "down": down,
+                "up": up,
+                "total_down": counters.bytes_recv,
+                "total_up": counters.bytes_sent,
+                "is_up": getattr(stats, 'isup', None),
+                "speed_mbps": speed if isinstance(speed, (int, float)) and speed > 0 else None,
+                "mtu": mtu if isinstance(mtu, (int, float)) and mtu > 0 else None,
+            })
+
+        self._last_net_by_interface = current
+        self.last_time = current_time
+        return {
+            "down": sum(interface["down"] for interface in interfaces),
+            "up": sum(interface["up"] for interface in interfaces),
+            "total_down": sum(interface["total_down"] for interface in interfaces),
+            "total_up": sum(interface["total_up"] for interface in interfaces),
+            "interfaces": interfaces,
+        }
+
+    def get_gpu(self):
+        drm = self._get_drm_gpus()
+        nvidia = self._get_nvidia_gpus()
+        if nvidia:
+            drm = [gpu for gpu in drm if gpu['vendor'] != 'NVIDIA']
+            drm.extend(nvidia)
+        if drm:
+            return drm
+        return [self._gpu_record('No GPU', None, status='unavailable')]
+
+    @staticmethod
+    def _gpu_record(name, vendor, **values):
+        record = {
+            'name': name, 'vendor': vendor, 'load': None,
+            'mem_used': None, 'mem_total': None, 'mem_pct': None,
+            'temperature': None, 'power_w': None, 'fan_pct': None,
+            'clock_graphics_mhz': None, 'clock_memory_mhz': None,
+            'status': 'limited telemetry',
+        }
+        record.update(values)
+        return record
+
+    def _get_drm_devices(self):
+        now = time.monotonic()
+        cached = getattr(self, '_drm_devices_cache', None)
+        cached_at = getattr(self, '_drm_devices_cache_at', None)
+        if cached is not None and cached_at is not None and now - cached_at < TOPOLOGY_CACHE_SECONDS:
+            return cached
+        root = os.path.join(SYS_PATH, 'class', 'drm')
+        vendors = {'0x8086': 'Intel', '0x1002': 'AMD', '0x10de': 'NVIDIA'}
+        devices = []
+        try:
+            cards = sorted(name for name in os.listdir(root)
+                           if name.startswith('card') and name[4:].isdigit())
+        except OSError:
+            cards = []
+        for card in cards:
+            path = os.path.join(root, card, 'device')
+            vendor_id = (self._read_sys_text(os.path.join(path, 'vendor')) or '').casefold()
+            vendor = vendors.get(vendor_id, vendor_id or 'Unknown')
+            devices.append((card, path, vendor))
+        self._drm_devices_cache = devices
+        self._drm_devices_cache_at = now
+        return devices
+
+    def _get_drm_gpus(self):
+        gpus = []
+        for card, path, vendor in self._get_drm_devices():
+            load_text = self._read_sys_text(os.path.join(path, 'gpu_busy_percent'))
+            try:
+                load = float(load_text) if load_text is not None else None
+            except ValueError:
+                load = None
+            if load is not None and not math.isfinite(load):
+                load = None
+            clock = None
+            if vendor == 'Intel':
+                card_path = os.path.join(SYS_PATH, 'class', 'drm', card)
+                for relative_path in ('gt_cur_freq_mhz',
+                                      os.path.join('gt', 'gt0', 'rps_cur_freq_mhz')):
+                    clock_text = self._read_sys_text(os.path.join(card_path, relative_path))
+                    try:
+                        clock = float(clock_text) if clock_text is not None else None
+                    except ValueError:
+                        clock = None
+                    if clock is not None and math.isfinite(clock) and clock >= 0:
+                        break
+                    clock = None
+            name = f'{vendor} GPU'
+            if load is not None:
+                status = 'available'
+            elif clock is not None:
+                status = 'frequency only'
+            else:
+                status = 'limited telemetry'
+            gpus.append(self._gpu_record(
+                name, vendor, load=load, clock_graphics_mhz=clock, status=status,
+            ))
+        return gpus
+
+    @staticmethod
+    def _optional_float(value):
+        if not value or value.casefold() in {'n/a', 'na', '[not supported]', 'not supported'}:
+            return None
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        return number if math.isfinite(number) else None
+
+    def _get_nvidia_gpus(self):
+        now = time.monotonic()
+        cached_at = getattr(self, '_nvidia_cache_at', None)
+        if cached_at is not None and now - cached_at < 2.0:
+            return getattr(self, '_nvidia_cache', [])
+        if now < getattr(self, '_nvidia_retry_at', 0.0):
+            if cached_at is not None and now - cached_at <= NVIDIA_STALE_SECONDS:
+                return [dict(gpu, status='stale telemetry')
+                        for gpu in getattr(self, '_nvidia_cache', [])]
+            self._nvidia_cache = []
+            return []
+        fields = (
+            'name,utilization.gpu,memory.used,memory.total,temperature.gpu,'
+            'power.draw,fan.speed,clocks.gr,clocks.mem'
+        )
+        try:
+            output = subprocess.check_output(
+                ['nvidia-smi', f'--query-gpu={fields}', '--format=csv,noheader,nounits'],
+                stderr=subprocess.DEVNULL, timeout=0.8,
+            ).decode('utf-8', errors='replace')
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            output = ''
+        gpus = []
+        for line in output.splitlines():
+            parts = [part.strip() for part in line.split(',')]
+            if len(parts) != 9 or not parts[0]:
+                continue
+            values = [self._optional_float(value) for value in parts[1:]]
+            load, mem_used, mem_total, temperature, power, fan, graphics, memory = values
+            mem_pct = None
+            if mem_used is not None and mem_total is not None and mem_total > 0:
+                mem_pct = round(mem_used / mem_total * 100, 1)
+            status = 'available' if load is not None else 'sleeping or unavailable'
+            gpus.append(self._gpu_record(
+                parts[0], 'NVIDIA', load=load, mem_used=mem_used,
+                mem_total=mem_total, mem_pct=mem_pct, temperature=temperature,
+                power_w=power, fan_pct=fan, clock_graphics_mhz=graphics,
+                clock_memory_mhz=memory, status=status,
+            ))
+        if gpus:
+            self._nvidia_cache_at = now
+            self._nvidia_cache = gpus
+            self._nvidia_failures = 0
+            self._nvidia_retry_at = now
+            return gpus
+
+        failures = getattr(self, '_nvidia_failures', 0) + 1
+        self._nvidia_failures = failures
+        delay = 0.0 if failures == 1 else min(10.0, 2.0 ** (failures - 1))
+        self._nvidia_retry_at = now + delay
+        if cached_at is not None and now - cached_at <= NVIDIA_STALE_SECONDS:
+            return [dict(gpu, status='stale telemetry')
+                    for gpu in getattr(self, '_nvidia_cache', [])]
+        self._nvidia_cache = []
+        return []
+
+    def get_procs(self, sort_by="cpu_percent", filter_str="", tree=True, limit=50):
+        # We need total memory for memory_percent calculation
+        try:
+            mem_info = self.get_mem()["mem"]
+            total_mem = mem_info.total
+        except Exception:
+            total_mem = 0
+
+        procs = self._fast.get_procs(total_mem_bytes=total_mem)
+
+        # Fallback to psutil if empty (e.g. not on Linux)
+        if not procs:
+            procs = []
+            for p in psutil.process_iter([
+                    'pid', 'ppid', 'name', 'username', 'cpu_percent',
+                    'memory_percent', 'cmdline', 'memory_info']):
+                try:
+                    info = p.info
+                    uid = None
+                    try:
+                        uid = p.uids().real
+                    except (AttributeError, NotImplementedError, psutil.NoSuchProcess,
+                            psutil.AccessDenied, psutil.ZombieProcess):
+                        pass
+                    username = info.get('username')
+                    if not isinstance(username, str) or not username:
+                        username = str(uid) if uid is not None else 'Unavailable'
+                    cmdline_list = info.get('cmdline')
+                    if isinstance(cmdline_list, (list, tuple)):
+                        cmdline = ' '.join(str(argument) for argument in cmdline_list)
+                    elif isinstance(cmdline_list, str):
+                        cmdline = cmdline_list
+                    else:
+                        cmdline = ''
+                    name = info.get('name')
+                    if not isinstance(name, str) or not name:
+                        name = 'unknown'
+                    memory_info = info.get('memory_info')
+                    rss = getattr(memory_info, 'rss', 0)
+                    if not isinstance(rss, (int, float)):
+                        rss = 0
+                    procs.append({
+                        'pid': info['pid'],
+                        'ppid': info.get('ppid'),
+                        'name': name,
+                        'uid': uid,
+                        'start_time': None,
+                        'username': username,
+                        'cmdline': cmdline or name,
+                        'cpu_percent': info.get('cpu_percent') or 0.0,
+                        'memory_percent': info.get('memory_percent') or 0.0,
+                        'rss': rss,
+                    })
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+
+        return prepare_processes(procs, sort_by, filter_str, tree, limit)
+
+    def get_connections(self):
+        return self._fast.get_connections()
+
+    def get_sys_info(self):
+        return self._fast.get_sys_info()

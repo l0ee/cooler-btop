@@ -1,0 +1,4 @@
+textual>=4.0,<9
+rich
+psutil>=5.9.0
+requests

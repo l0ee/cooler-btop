@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cooler-btop"
+version = "2.0.0"
+description = "A Linux system monitor with terminal and local web interfaces"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "l0ee"}
+]
+dependencies = [
+    "textual>=4.0,<9",
+    "rich",
+    "psutil>=5.9.0",
+    "requests"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Monitoring",
+]
+
+[project.scripts]
+cooler-btop = "cooler_btop.main:run_cli"
+
+[project.urls]
+Homepage = "https://github.com/l0ee/cooler-btop"
+Issues = "https://github.com/l0ee/cooler-btop/issues"
+Security = "https://github.com/l0ee/cooler-btop/security/advisories/new"
+
+[tool.setuptools.packages.find]
+include = ["cooler_btop*"]
+
+[tool.setuptools.package-data]
+cooler_btop = ["web/*.html"]

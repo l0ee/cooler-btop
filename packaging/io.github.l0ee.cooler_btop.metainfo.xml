@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>io.github.l0ee.cooler_btop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Cooler btop</name>
+  <summary>Monitor Linux resources from a terminal</summary>
+  <developer id="io.github.l0ee">
+    <name>l0ee</name>
+  </developer>
+  <description>
+    <p>Cooler btop displays CPU, memory, storage, network, GPU, and process telemetry in a responsive terminal interface.</p>
+    <p>It can also serve a local web dashboard when explicitly started in daemon mode.</p>
+  </description>
+  <launchable type="desktop-id">io.github.l0ee.cooler_btop.desktop</launchable>
+  <icon type="stock">io.github.l0ee.cooler_btop</icon>
+  <url type="homepage">https://github.com/l0ee/cooler-btop</url>
+  <url type="bugtracker">https://github.com/l0ee/cooler-btop/issues</url>
+  <url type="vcs-browser">https://github.com/l0ee/cooler-btop</url>
+  <provides>
+    <binary>cooler-btop</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+    <category>Monitor</category>
+  </categories>
+  <releases>
+    <release version="2.0.0" date="2026-09-13"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

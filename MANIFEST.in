@@ -1,0 +1,19 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include SECURITY.md
+include Dockerfile
+include .dockerignore
+include Makefile
+include main.py
+include install.sh
+include benchmark.py
+include docker-compose.yml
+include requirements.txt
+include stress_test.py
+include test_*.py
+include docs/generated-task-ideas.md
+include .github/workflows/*.yml
+include packaging/verify-rpm.sh
+recursive-include cooler_btop/web *.html
+recursive-include packaging *.desktop *.svg *.xml *.1 *.spec

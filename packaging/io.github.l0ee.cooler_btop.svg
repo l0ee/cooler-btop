@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img">
+  <title>Cooler btop terminal monitor</title>
+  <desc>A mint terminal window with an amber telemetry pulse and cooling vents</desc>
+  <defs>
+    <linearGradient id="shell" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#16242a"/>
+      <stop offset="1" stop-color="#0b1014"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="12" width="112" height="96" rx="18" fill="url(#shell)" stroke="#a3e6ba" stroke-width="6"/>
+  <circle cx="27" cy="31" r="5" fill="#efb078"/>
+  <circle cx="44" cy="31" r="5" fill="#82c9d7"/>
+  <path d="M22 70h18l9-24 15 48 13-34 8 10h21" fill="none" stroke="#efb078" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M34 118h60M45 108v10M83 108v10" fill="none" stroke="#82c9d7" stroke-width="6" stroke-linecap="round"/>
+</svg>

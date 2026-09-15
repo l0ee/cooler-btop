@@ -1,0 +1,100 @@
+name: Cooler btop release
+
+"on":
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:44
+
+    steps:
+    - name: Install Fedora build dependencies
+      run: |
+        dnf --assumeyes --setopt=install_weak_deps=False install \
+          appstream \
+          cpio \
+          desktop-file-utils \
+          git \
+          make \
+          pyproject-rpm-macros \
+          python3-devel \
+          python3-pip \
+          python3-psutil \
+          python3-pyyaml \
+          python3-requests \
+          python3-rich \
+          python3-setuptools \
+          python3-textual \
+          python3-wheel \
+          rpm-build
+
+    - uses: actions/checkout@v5
+
+    - name: Require tag to match project version
+      run: |
+        expected_tag="v$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+        test "$GITHUB_REF_NAME" = "$expected_tag"
+
+    - name: Build and validate release artifacts
+      run: make release
+
+    - name: Verify release checksums
+      run: cd dist && sha256sum --check SHA256SUMS
+
+    - name: Confirm package was not installed
+      run: |
+        set +e
+        query_output=$(LC_ALL=C rpm -q cooler-btop 2>&1)
+        query_status=$?
+        set -e
+        test "$query_status" -eq 1
+        test "$query_output" = "package cooler-btop is not installed"
+
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-files
+        path: |
+          dist/cooler-btop-2.0.0-1.fc44.noarch.rpm
+          dist/cooler-btop-2.0.0-1.fc44.src.rpm
+          dist/cooler_btop-2.0.0-py3-none-any.whl
+          dist/cooler_btop-2.0.0.tar.gz
+          dist/SHA256SUMS
+        if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download release artifacts
+      uses: actions/download-artifact@v5
+      with:
+        name: release-files
+        path: dist
+
+    - name: Verify downloaded artifacts
+      run: |
+        test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 5
+        cd dist
+        sha256sum --check SHA256SUMS
+
+    - name: Create GitHub release
+      env:
+        GH_REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ github.token }}
+      run: >-
+        gh release create "$GITHUB_REF_NAME"
+        dist/cooler-btop-2.0.0-1.fc44.noarch.rpm
+        dist/cooler-btop-2.0.0-1.fc44.src.rpm
+        dist/cooler_btop-2.0.0-py3-none-any.whl
+        dist/cooler_btop-2.0.0.tar.gz
+        dist/SHA256SUMS
+        --verify-tag --generate-notes

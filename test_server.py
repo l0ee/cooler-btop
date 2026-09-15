@@ -44,8 +44,13 @@ class TestMetricsServer(unittest.TestCase):
         self.collector.get_sys_info.return_value = {
             'hostname': 'test-host', 'uptime': 1234.5, 'load_avg': (0.1, 0.2, 0.3),
         }
-        self.kill = self.enterContext(mock.patch('cooler_btop.server.os.kill'))
-        self.enterContext(mock.patch.object(server.MetricsHandler, 'log_message'))
+        kill_patcher = mock.patch('cooler_btop.server.os.kill')
+        self.kill = kill_patcher.start()
+        self.addCleanup(kill_patcher.stop)
+
+        log_patcher = mock.patch.object(server.MetricsHandler, 'log_message')
+        log_patcher.start()
+        self.addCleanup(log_patcher.stop)
 
     def start_server(self, interval=60.0, logger=None, wait=True):
         kwargs = {} if interval is None else {'interval': interval}

@@ -681,14 +681,16 @@ class TelemetryFixtureTests(unittest.TestCase):
         }
         current = {'eth0': SimpleNamespace(bytes_recv=200, bytes_sent=300)}
         with mock.patch.object(data.time, 'monotonic', return_value=12.0), \
-             mock.patch.object(data.psutil, 'net_io_counters', return_value=current):
+             mock.patch.object(data.psutil, 'net_io_counters', return_value=current), \
+             mock.patch.object(data.psutil, 'net_if_stats', return_value={}):
             net = collector.get_net()
         self.assertEqual(net['down'], 50.0)
         self.assertEqual(net['up'], 50.0)
 
         reset = {'eth0': SimpleNamespace(bytes_recv=150, bytes_sent=250)}
         with mock.patch.object(data.time, 'monotonic', return_value=14.0), \
-             mock.patch.object(data.psutil, 'net_io_counters', return_value=reset):
+             mock.patch.object(data.psutil, 'net_io_counters', return_value=reset), \
+             mock.patch.object(data.psutil, 'net_if_stats', return_value={}):
             net = collector.get_net()
         self.assertEqual(net['down'], 0)
         self.assertEqual(net['up'], 0)
@@ -715,7 +717,8 @@ class TelemetryFixtureTests(unittest.TestCase):
             'new0': SimpleNamespace(bytes_recv=500000, bytes_sent=600000),
         }
         with mock.patch.object(data.time, 'monotonic', return_value=12.0), \
-             mock.patch.object(data.psutil, 'net_io_counters', return_value=current):
+             mock.patch.object(data.psutil, 'net_io_counters', return_value=current), \
+             mock.patch.object(data.psutil, 'net_if_stats', return_value={}):
             net = collector.get_net()
 
         self.assertEqual((net['down'], net['up']), (10.0, 20.0))
@@ -731,7 +734,8 @@ class TelemetryFixtureTests(unittest.TestCase):
 
         reset = {'eth0': SimpleNamespace(bytes_recv=5, bytes_sent=7)}
         with mock.patch.object(data.time, 'monotonic', return_value=14.0), \
-             mock.patch.object(data.psutil, 'net_io_counters', return_value=reset):
+             mock.patch.object(data.psutil, 'net_io_counters', return_value=reset), \
+             mock.patch.object(data.psutil, 'net_if_stats', return_value={}):
             net = collector.get_net()
         self.assertEqual((net['down'], net['up']), (0, 0))
         self.assertEqual(net['interfaces'][0]['name'], 'eth0')
@@ -746,7 +750,8 @@ class TelemetryFixtureTests(unittest.TestCase):
         initial = {'eth0': SimpleNamespace(bytes_recv=100, bytes_sent=200)}
         recreated = {'eth0': SimpleNamespace(bytes_recv=150, bytes_sent=260)}
         with mock.patch.object(data.time, 'monotonic', side_effect=[1.0, 2.0]), \
-             mock.patch.object(data.psutil, 'net_io_counters', side_effect=[initial, recreated]):
+             mock.patch.object(data.psutil, 'net_io_counters', side_effect=[initial, recreated]), \
+             mock.patch.object(data.psutil, 'net_if_stats', return_value={}):
             collector.get_net()
             ifindices['eth0'] = 9
             net = collector.get_net()

@@ -12,7 +12,6 @@ include docker-compose.yml
 include requirements.txt
 include stress_test.py
 include test_*.py
-include docs/generated-task-ideas.md
 include .github/workflows/*.yml
 include packaging/verify-rpm.sh
 recursive-include cooler_btop/web *.html

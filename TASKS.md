@@ -9,9 +9,6 @@
 - [ ] Add one-shot JSON and CSV export commands.
 - [ ] Add per-process disk I/O to the process table.
 
-## Later
-- [ ] Review and promote justified ideas from `docs/generated-task-ideas.md` based on user requests and tested hardware.
-
 ## Needs Threat Model
 - [ ] Review any privileged, destructive, remote-control, active-scanning, plugin, arbitrary-command, or sensitive-data feature before implementation.
 

@@ -11,6 +11,7 @@ from collections import namedtuple
 from unittest import mock
 
 
+import stress_test
 from cooler_btop import server
 
 
@@ -406,6 +407,70 @@ class TestMetricsServer(unittest.TestCase):
             result = server.run_server()
         self.assertEqual(result, 1)
         fake_server.server_close.assert_called_once_with()
+
+
+class TestStressTestCleanup(unittest.TestCase):
+    def test_partial_startup_cleans_up_started_processes(self):
+        daemon = mock.Mock()
+        load = mock.Mock()
+        with mock.patch.object(stress_test.time, 'sleep'), \
+                mock.patch.object(
+                    stress_test.subprocess,
+                    'Popen',
+                    side_effect=[daemon, load, OSError('spawn failed')],
+                ):
+            with self.assertRaisesRegex(OSError, 'spawn failed'):
+                stress_test.run_stress_test()
+
+        daemon.terminate.assert_called_once_with()
+        daemon.wait.assert_called_once_with(timeout=2)
+        load.terminate.assert_called_once_with()
+        load.wait.assert_called_once_with(timeout=2)
+
+    def test_cleanup_kills_process_that_does_not_terminate(self):
+        daemon = mock.Mock()
+        daemon.wait.side_effect = [
+            stress_test.subprocess.TimeoutExpired('cooler-btop', 2),
+            None,
+        ]
+        with mock.patch.object(stress_test.time, 'sleep'), \
+                mock.patch.object(
+                    stress_test.subprocess,
+                    'Popen',
+                    side_effect=[daemon, OSError('spawn failed')],
+                ):
+            with self.assertRaisesRegex(OSError, 'spawn failed'):
+                stress_test.run_stress_test()
+
+        daemon.terminate.assert_called_once_with()
+        daemon.kill.assert_called_once_with()
+        self.assertEqual(
+            daemon.wait.call_args_list,
+            [mock.call(timeout=2), mock.call(timeout=2)],
+        )
+
+    def test_cleanup_error_does_not_mask_startup_failure_or_skip_processes(self):
+        daemon = mock.Mock()
+        first_load = mock.Mock()
+        first_load.wait.side_effect = [OSError('wait failed'), None]
+        second_load = mock.Mock()
+        with mock.patch.object(stress_test.time, 'sleep'), \
+                mock.patch.object(
+                    stress_test.subprocess,
+                    'Popen',
+                    side_effect=[
+                        daemon,
+                        first_load,
+                        second_load,
+                        OSError('spawn failed'),
+                    ],
+                ):
+            with self.assertRaisesRegex(OSError, 'spawn failed'):
+                stress_test.run_stress_test()
+
+        first_load.kill.assert_called_once_with()
+        second_load.terminate.assert_called_once_with()
+        daemon.terminate.assert_called_once_with()
 
 
 if __name__ == '__main__':

@@ -15,6 +15,8 @@ crash3.log
 *.log
 .opencode/
 .superpowers/
+docs/superpowers/
+docs/generated-task-ideas.md
 AGENT_RULES.md
 continuous_runner.sh
 OPTIMIZATION_LOG.md

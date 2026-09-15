@@ -4,27 +4,44 @@ import subprocess
 import requests
 import threading
 
+
+def _stop_process(process):
+    if process is None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def run_stress_test(port=8080):
     print("Starting Stress & Hardening Test (Stage D)...")
 
-    # 1. Spawn a background daemon server
-    print("Launching daemon server...")
-    server_proc = subprocess.Popen([sys.executable, "-m", "cooler_btop", "--daemon", "--port", str(port)])
-    time.sleep(2) # let it boot
-
-    # 2. Spawn dummy load processes
-    print("Spawning dummy load processes to populate /proc...")
+    server_proc = None
     load_procs = []
-    for _ in range(4):
-        p = subprocess.Popen([sys.executable, "-c", "while True: pass"])
-        load_procs.append(p)
 
     try:
-        # 3. Bombard the SSE endpoint and measure memory stability
+        print("Launching daemon server...")
+        server_proc = subprocess.Popen(
+            [sys.executable, "-m", "cooler_btop", "--daemon", "--port", str(port)]
+        )
+        time.sleep(2)
+
+        print("Spawning dummy load processes to populate /proc...")
+        for _ in range(4):
+            process = subprocess.Popen([sys.executable, "-c", "while True: pass"])
+            load_procs.append(process)
+
         print("Bombarding SSE endpoint for 10 seconds...")
-
         url = f"http://localhost:{port}/api/metrics/stream"
-
         stream_errors = []
 
         def consume_stream():
@@ -38,7 +55,6 @@ def run_stress_test(port=8080):
             except Exception as error:
                 stream_errors.append(str(error))
 
-        # Simulate multiple concurrent browser dashboard connections
         threads = []
         for _ in range(5):
             t = threading.Thread(target=consume_stream)
@@ -59,13 +75,9 @@ def run_stress_test(port=8080):
 
     finally:
         print("Cleaning up...")
-        for p in load_procs:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        server_proc.terminate()
-        server_proc.wait()
+        for process in load_procs:
+            _stop_process(process)
+        _stop_process(server_proc)
 
     print("Stress test completed successfully.")
 

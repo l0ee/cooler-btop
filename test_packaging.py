@@ -665,6 +665,7 @@ class DistributionTests(unittest.TestCase):
             "main.py",
             "install.sh",
             "benchmark.py",
+            "stress_test.py",
             "test_collector.py",
             "test_main.py",
             "test_packaging.py",

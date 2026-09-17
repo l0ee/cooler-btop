@@ -14,7 +14,7 @@ authors = [
 ]
 dependencies = [
     "textual>=4.0,<9",
-    "rich>=13,<15",
+    "rich>=13,<16",
     "psutil>=5.9.0",
     "requests>=2.31,<3"
 ]

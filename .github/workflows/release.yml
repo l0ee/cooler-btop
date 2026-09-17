@@ -9,8 +9,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    container: fedora:44
+    runs-on: ubuntu-24.04
+    container: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
     timeout-minutes: 30
     permissions:
       contents: read
@@ -42,6 +42,9 @@ jobs:
           rpm-build
 
     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      with:
+        persist-credentials: false
+        fetch-depth: 0
 
     - name: Require tag to match project version
       id: project_version
@@ -49,6 +52,10 @@ jobs:
         expected_tag="v$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
         echo "version=${expected_tag#v}" >> "$GITHUB_OUTPUT"
         test "$GITHUB_REF_NAME" = "$expected_tag"
+        test "${GITHUB_REF_PROTECTED:-false}" = true
+        test "$(git for-each-ref --format='%(objecttype)' "refs/tags/$GITHUB_REF_NAME")" = tag
+        test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$GITHUB_SHA"
+        git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
 
     - name: Build and validate release artifacts
       run: make release
@@ -84,8 +91,10 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
+    environment:
+      name: release
     permissions:
       contents: write
 

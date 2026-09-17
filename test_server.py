@@ -2,9 +2,12 @@ import gzip
 import http.client
 import io
 import json
+import logging
 import os
 import sqlite3
+import stat
 import threading
+import tempfile
 import time
 import unittest
 from collections import namedtuple
@@ -193,6 +196,7 @@ class TestMetricsServer(unittest.TestCase):
         self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
         self.assertEqual(headers['X-Frame-Options'], 'DENY')
         self.assertEqual(headers['Referrer-Policy'], 'no-referrer')
+        self.assertIn("default-src 'none'", headers['Content-Security-Policy'])
         self.assertEqual(int(headers['Content-Length']), len(compressed))
         self.assertEqual(gzip.decompress(compressed), payload)
 
@@ -223,6 +227,23 @@ class TestMetricsServer(unittest.TestCase):
         self.assertEqual(status, 200)
         cookie = headers['Set-Cookie'].split(';', 1)[0]
         self.assertEqual(self.request('/api/metrics', headers={'Cookie': cookie})[0], 200)
+
+    def test_query_tokens_only_authenticate_dashboard_exchange(self):
+        self.start_server(auth_token='test-secret')
+        for path in ('/api/metrics?token=test-secret',
+                     '/api/metrics/stream?token=test-secret',
+                     '/api/unknown?token=test-secret'):
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path)[0], 401)
+
+        status, headers, _ = self.request('/?token=test-secret')
+        self.assertEqual(status, 200)
+        self.assertIn('HttpOnly', headers['Set-Cookie'])
+        status, headers, _ = self.request(
+            '/?token=wrong', headers={'Authorization': 'Bearer test-secret'},
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn('Set-Cookie', headers)
 
     def test_non_loopback_bind_requires_a_token(self):
         with self.assertRaisesRegex(ValueError, 'non-loopback'):
@@ -523,6 +544,82 @@ class TestMetricsServer(unittest.TestCase):
         self.assertEqual(result, 1)
         collector.close.assert_called_once_with()
         logger.close.assert_called_once_with()
+
+
+class TestServerSecurityHelpers(unittest.TestCase):
+    def test_access_log_redacts_query_tokens(self):
+        handler = object.__new__(server.MetricsHandler)
+        handler.address_string = mock.Mock(return_value='127.0.0.1')
+        logger = logging.getLogger(server.__name__)
+        with mock.patch.object(logger, 'info') as access_log:
+            server.MetricsHandler.log_message(
+                handler,
+                '"%s" %s %s',
+                'GET /?token=access-secret&view=full HTTP/1.1',
+                200,
+                '-',
+            )
+        self.assertTrue(access_log.called)
+        logged = ' '.join(str(value) for value in access_log.call_args.args)
+        self.assertNotIn('access-secret', logged)
+        self.assertIn('[redacted]', logged)
+
+    def test_auth_token_file_requires_private_regular_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'token')
+            with open(path, 'w', encoding='utf-8') as token_file:
+                token_file.write('file-secret\n')
+            os.chmod(path, 0o600)
+            self.assertEqual(server.read_auth_token_file(path), 'file-secret')
+
+            os.chmod(path, 0o640)
+            with self.assertRaisesRegex(ValueError, 'owner-readable only'):
+                server.read_auth_token_file(path)
+
+            os.chmod(path, 0o600)
+            link = os.path.join(directory, 'token-link')
+            os.symlink(path, link)
+            with self.assertRaisesRegex(ValueError, 'must not be a symlink'):
+                server.read_auth_token_file(link)
+
+    def test_database_file_and_new_parent_are_private_even_with_permissive_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'private', 'metrics.sqlite')
+            old_umask = os.umask(0o022)
+            try:
+                logger = server.DBLogger(path)
+            finally:
+                os.umask(old_umask)
+            self.addCleanup(logger.close)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+
+            os.chmod(path, 0o644)
+            logger.close()
+            private_again = server.DBLogger(path)
+            self.addCleanup(private_again.close)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_database_rejects_symlink_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, 'target.sqlite')
+            link = os.path.join(directory, 'metrics.sqlite')
+            with open(target, 'wb'):
+                pass
+            os.symlink(target, link)
+            with self.assertRaisesRegex(ValueError, 'must not be symlinks'):
+                server.DBLogger(link)
+
+    def test_database_file_uri_is_prepared_as_a_private_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uri_like_path = os.path.join(directory, 'metrics.sqlite?mode=rwc')
+            logger = server.DBLogger(uri_like_path)
+            self.addCleanup(logger.close)
+            self.assertEqual(stat.S_IMODE(os.stat(uri_like_path).st_mode), 0o600)
+
+    def test_unicode_tokens_are_compared_without_type_errors(self):
+        self.assertTrue(server._auth_token_matches('sécret', 'sécret'))
+        self.assertFalse(server._auth_token_matches('wrong', 'sécret'))
 
 
 class TestStressTestCleanup(unittest.TestCase):

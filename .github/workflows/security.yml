@@ -1,0 +1,69 @@
+name: Cooler btop security
+
+"on":
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cooler-btop-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.14
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      with:
+        python-version: "3.14"
+
+    - name: Install package and security tools
+      run: |
+        python -m pip install --disable-pip-version-check --no-cache-dir -r requirements.lock
+        python -m pip install --disable-pip-version-check --no-cache-dir '.[test]'
+        python -m pip install --disable-pip-version-check --no-cache-dir \
+          'bandit==1.9.4' 'pip-audit==2.10.1' 'yamllint==1.38.0'
+
+    - name: Verify dependency resolution
+      run: python -m pip check
+
+    - name: Run Bandit
+      run: python -m bandit -q -r cooler_btop
+
+    - name: Run pip-audit
+      run: |
+        pip-audit -r requirements.lock
+        pip-audit
+
+    - name: Validate YAML
+      run: yamllint -d relaxed .github/workflows/*.yml docker-compose.yml
+
+    - name: Validate shell scripts
+      run: shellcheck install.sh packaging/verify-rpm.sh
+
+    - name: Validate GitHub Actions expressions
+      run: |
+        actionlint_tmp="$(mktemp -d)"
+        curl --fail --location --silent --show-error \
+          --proto '=https' --tlsv1.2 \
+          -o "$actionlint_tmp/actionlint.tgz" \
+          https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+        printf '%s  %s\n' \
+          8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 \
+          "$actionlint_tmp/actionlint.tgz" | sha256sum --check
+        tar -xzf "$actionlint_tmp/actionlint.tgz" -C "$actionlint_tmp"
+        "$actionlint_tmp/actionlint" .github/workflows/*.yml
+
+    - name: Validate web JavaScript and security tests
+      run: python -m unittest -v test_web test_server.TestServerSecurityHelpers

@@ -6,12 +6,16 @@ __pycache__/
 env/
 venv/
 .venv/
+.venv*/
 env.bak/
 venv.bak/
 metrics.sqlite
 *.sqlite
 *.sqlite3
 *.db
+*.sqlite-*
+*.sqlite3-*
+*.db-*
 .env
 .env.*
 crash.log

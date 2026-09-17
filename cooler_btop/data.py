@@ -4,7 +4,7 @@ import os
 import psutil
 import re
 import socket
-import subprocess
+import subprocess  # nosec B404
 import time
 from collections import namedtuple
 
@@ -776,7 +776,7 @@ class DataCollector:
             'power.draw,fan.speed,clocks.gr,clocks.mem'
         )
         try:
-            output = subprocess.check_output(
+            output = subprocess.check_output(  # nosec B603 B607
                 ['nvidia-smi', f'--query-gpu={fields}', '--format=csv,noheader,nounits'],
                 stderr=subprocess.DEVNULL, timeout=0.8,
             ).decode('utf-8', errors='replace')
@@ -947,4 +947,4 @@ class DataCollector:
         try:
             self.close()
         except Exception:
-            pass
+            pass  # nosec B110

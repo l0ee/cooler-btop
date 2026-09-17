@@ -34,7 +34,7 @@ package-check:
 	$(PYTHON) -m unittest -v test_packaging
 
 coverage:
-	$(PYTHON) -m coverage run --branch -m unittest discover -v
+	$(PYTHON) -m coverage run --branch --source=cooler_btop -m unittest discover -v
 	$(PYTHON) -m coverage report --fail-under=70
 
 reproducibility-check:
@@ -160,7 +160,8 @@ wheel-smoke: wheel
 	wheel=$$(realpath -- "$$wheel"); \
 	$(PYTHON) -m venv "$$tmpdir/venv"; \
 	cd "$$tmpdir"; \
-	"$$tmpdir/venv/bin/python" -m pip install "$$wheel"; \
+	"$$tmpdir/venv/bin/python" -m pip install -r "$(PROJECT_ROOT)requirements.lock"; \
+	"$$tmpdir/venv/bin/python" -m pip install --no-deps "$$wheel"; \
 	"$$tmpdir/venv/bin/cooler-btop" --version
 
 benchmark:

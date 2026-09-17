@@ -10,9 +10,14 @@ include install.sh
 include benchmark.py
 include docker-compose.yml
 include requirements.txt
+include requirements.lock
+include CONTRIBUTING.md
 include stress_test.py
 include test_*.py
 include .github/workflows/*.yml
+include .github/CODEOWNERS
+include .github/dependabot.yml
+include .github/pull_request_template.md
 include packaging/verify-rpm.sh
 recursive-include cooler_btop/web *.html
 recursive-include packaging *.desktop *.svg *.xml *.1 *.spec

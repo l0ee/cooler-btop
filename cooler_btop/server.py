@@ -8,8 +8,10 @@ import hmac
 import ipaddress
 import logging
 import math
+import re
 import signal
 import socket
+import stat
 from http.cookies import CookieError, SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -24,6 +26,21 @@ DEFAULT_STALE_SNAPSHOT_MULTIPLIER = 3.0
 MIN_STALE_SNAPSHOT_AGE = 1.0
 DEFAULT_LOG_RETENTION_ROWS = 100_000
 MAX_AUTH_TOKEN_LENGTH = 4096
+AUTH_FILE_ENV = 'COOLER_BTOP_AUTH_TOKEN_FILE'
+PRIVATE_DATABASE_MODE = 0o600
+PRIVATE_DATABASE_DIRECTORY_MODE = 0o700
+TOKEN_QUERY_PATTERN = re.compile(r'([?&]token=)[^&\s"]*', re.IGNORECASE)
+SECURITY_HEADERS = {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': (
+        "default-src 'none'; base-uri 'none'; object-src 'none'; "
+        "connect-src 'self'; script-src 'unsafe-inline'; "
+        "style-src 'unsafe-inline'; img-src 'self' data:; "
+        "font-src 'self'; frame-ancestors 'none'; form-action 'none'"
+    ),
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,9 +48,131 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+
+def _redact_log_text(value):
+    """Remove bearer tokens from request/access-log text before emission."""
+    return TOKEN_QUERY_PATTERN.sub(r'\1[redacted]', str(value))
+
+
+def _auth_token_matches(provided, expected):
+    """Compare tokens without leaking timing or raising on non-ASCII input."""
+    if not provided or not expected:
+        return False
+    try:
+        return hmac.compare_digest(
+            str(provided).encode('utf-8'), str(expected).encode('utf-8')
+        )
+    except (TypeError, UnicodeError):
+        return False
+
+
+def read_auth_token_file(path):
+    """Read a UTF-8 auth token from a private, regular file.
+
+    The file must be owner-readable and have no group/other permission bits.
+    Symlinks are rejected so a privileged service cannot be redirected to an
+    unrelated file by a changed path.
+    """
+    path = os.fsdecode(os.fspath(path))
+    _reject_symlink_components(os.path.dirname(os.path.abspath(path)))
+    flags = os.O_RDONLY
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    if nofollow:
+        flags |= nofollow
+    fd = None
+    try:
+        file_stat = os.lstat(path)
+        if stat.S_ISLNK(file_stat.st_mode):
+            raise ValueError('auth token file must not be a symlink')
+        fd = os.open(path, flags)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError('auth token file must be a regular file')
+        if not (file_stat.st_mode & stat.S_IRUSR) or file_stat.st_mode & 0o077:
+            raise ValueError('auth token file must be owner-readable only (mode 0600)')
+        with os.fdopen(fd, 'rb') as token_file:
+            fd = None
+            raw = token_file.read(MAX_AUTH_TOKEN_LENGTH + 2)
+    except OSError as error:
+        raise ValueError(f'could not read auth token file: {error}') from error
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        token = raw.decode('utf-8').strip()
+    except UnicodeDecodeError as error:
+        raise ValueError('auth token file must contain UTF-8 text') from error
+    if not token or len(token) > MAX_AUTH_TOKEN_LENGTH:
+        raise ValueError(f'auth token must contain 1-{MAX_AUTH_TOKEN_LENGTH} characters')
+    return token
+
+
+def _reject_symlink_components(path):
+    """Fail closed if an existing path component is a symlink or non-directory."""
+    absolute = os.path.abspath(path)
+    current = os.path.sep if absolute.startswith(os.path.sep) else ''
+    for component in absolute.split(os.path.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            component_stat = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ValueError(f'could not inspect database path: {error}') from error
+        if stat.S_ISLNK(component_stat.st_mode):
+            raise ValueError('SQLite database paths must not contain symlinks')
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError('SQLite database parent components must be directories')
+
+
+def _prepare_private_database_path(path):
+    """Create/check a SQLite path with private permissions before connecting."""
+    path = os.fsdecode(os.fspath(path))
+    if path == ':memory:':
+        return path
+    absolute = os.path.abspath(path)
+    parent_dir = os.path.dirname(absolute)
+    _reject_symlink_components(parent_dir)
+    try:
+        os.makedirs(parent_dir, mode=PRIVATE_DATABASE_DIRECTORY_MODE, exist_ok=True)
+    except OSError as error:
+        raise ValueError(f'could not create SQLite database directory: {error}') from error
+    _reject_symlink_components(parent_dir)
+
+    try:
+        final_stat = os.lstat(absolute)
+    except FileNotFoundError:
+        final_stat = None
+    except OSError as error:
+        raise ValueError(f'could not inspect SQLite database: {error}') from error
+    if final_stat is not None:
+        if stat.S_ISLNK(final_stat.st_mode):
+            raise ValueError('SQLite database paths must not be symlinks')
+        if not stat.S_ISREG(final_stat.st_mode):
+            raise ValueError('SQLite database path must be a regular file')
+
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        fd = os.open(absolute, flags, PRIVATE_DATABASE_MODE)
+        try:
+            opened_stat = os.fstat(fd)
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise ValueError('SQLite database path must be a regular file')
+            os.fchmod(fd, PRIVATE_DATABASE_MODE)
+        finally:
+            os.close(fd)
+    except OSError as error:
+        raise ValueError(f'could not prepare SQLite database: {error}') from error
+    return absolute
+
 class DBLogger:
     def __init__(self, db_path, max_rows=DEFAULT_LOG_RETENTION_ROWS):
-        self.db_path = db_path
+        self.db_path = os.fsdecode(os.fspath(db_path))
         try:
             max_rows = int(max_rows)
         except (TypeError, ValueError) as error:
@@ -45,45 +184,71 @@ class DBLogger:
         self._writes_since_prune = 0
         self._lock = threading.RLock()
         self._closed = False
-
-        # Ensure parent directory exists
-        parent_dir = os.path.dirname(os.path.abspath(db_path))
-        if parent_dir and not os.path.exists(parent_dir):
-            try:
-                os.makedirs(parent_dir, exist_ok=True)
-            except Exception as e:
-                print(f"Warning: Could not create directory for SQLite DB: {e}")
-
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._init_db()
+        self.conn = None
+        try:
+            self.db_path = _prepare_private_database_path(self.db_path)
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._init_db()
+        except Exception:
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass  # nosec B110
+            self._closed = True
+            raise
 
     def _init_db(self):
-        c = self.conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS metrics
-                     (timestamp REAL, cpu_total REAL, mem_used REAL,
-                      net_down REAL, net_up REAL)''')
-        c.execute('CREATE INDEX IF NOT EXISTS metrics_timestamp_idx ON metrics(timestamp)')
-        self.conn.commit()
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('PRAGMA secure_delete=ON')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS metrics
+                         (timestamp REAL, cpu_total REAL, mem_used REAL,
+                          net_down REAL, net_up REAL)''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS metrics_timestamp_idx ON metrics(timestamp)')
+            self.conn.commit()
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass  # nosec B110
+            raise
+        finally:
+            if cursor is not None:
+                cursor.close()
 
     def log(self, cpu, mem, net):
         with self._lock:
             if self._closed:
                 return
-            c = self.conn.cursor()
-            c.execute('INSERT INTO metrics VALUES (?, ?, ?, ?, ?)',
-                      (time.time(), cpu['total'], mem['mem']['used'],
-                       net['down'], net['up']))
-            self._writes_since_prune += 1
-            if self._writes_since_prune >= self._prune_every:
-                # rowid is used instead of timestamp so equal timestamps do
-                # not accidentally delete more or fewer rows than intended.
-                c.execute(
-                    'DELETE FROM metrics WHERE rowid NOT IN '
-                    '(SELECT rowid FROM metrics ORDER BY timestamp DESC, rowid DESC LIMIT ?)',
-                    (self.max_rows,),
-                )
-                self._writes_since_prune = 0
-            self.conn.commit()
+            cursor = None
+            writes_since_prune = self._writes_since_prune + 1
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('INSERT INTO metrics VALUES (?, ?, ?, ?, ?)',
+                               (time.time(), cpu['total'], mem['mem']['used'],
+                                net['down'], net['up']))
+                if writes_since_prune >= self._prune_every:
+                    # rowid is used instead of timestamp so equal timestamps do
+                    # not accidentally delete more or fewer rows than intended.
+                    cursor.execute(
+                        'DELETE FROM metrics WHERE rowid NOT IN '
+                        '(SELECT rowid FROM metrics ORDER BY timestamp DESC, rowid DESC LIMIT ?)',
+                        (self.max_rows,),
+                    )
+                    writes_since_prune = 0
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass  # nosec B110
+                raise
+            finally:
+                if cursor is not None:
+                    cursor.close()
+            self._writes_since_prune = writes_since_prune
 
     def close(self):
         with self._lock:
@@ -197,7 +362,7 @@ class MetricsServer(ThreadingHTTPServer):
         if not _host_is_loopback(server_address[0]) and not auth_token:
             raise ValueError(
                 'non-loopback daemon binds require --auth-token '
-                '(or COOLER_BTOP_AUTH_TOKEN)'
+                '(or COOLER_BTOP_AUTH_TOKEN/COOLER_BTOP_AUTH_TOKEN_FILE)'
             )
         self.auth_token = auth_token
         self.privacy_mode = bool(privacy_mode)
@@ -479,15 +644,30 @@ class MetricsHandler(BaseHTTPRequestHandler):
         '/': ('index.html', 'text/html; charset=utf-8'),
     }
 
+    server_version = 'cooler-btop'
+    sys_version = ''
+
+    def version_string(self):
+        return self.server_version
+
+    def log_message(self, format, *args):
+        """Send access logs through logging after removing URL token values."""
+        try:
+            message = format % args
+        except (TypeError, ValueError):
+            message = format
+        logging.getLogger(__name__).info(
+            '%s - %s', self.address_string(), _redact_log_text(message)
+        )
+
     def _respond(self, status, payload, content_type='application/json', headers=None):
         try:
             self.send_response(status)
             self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(payload)))
-            self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('X-Frame-Options', 'DENY')
-            self.send_header('Referrer-Policy', 'no-referrer')
-            for name, value in (headers or {}).items():
+            response_headers = dict(SECURITY_HEADERS)
+            response_headers.update(headers or {})
+            for name, value in response_headers.items():
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(payload)
@@ -495,7 +675,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _query_token(self):
-        query = parse_qs(urlsplit(self.path).query, keep_blank_values=False)
+        try:
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=False)
+        except ValueError:
+            return None
         values = query.get('token') or []
         return values[0] if values else None
 
@@ -511,7 +694,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
         except (CookieError, TypeError, ValueError):
             return None
 
-    def _authorized(self):
+    def _authorized(self, allow_query_token=False):
         expected = getattr(self.server, 'auth_token', None)
         if not expected:
             return True
@@ -521,11 +704,11 @@ class MetricsHandler(BaseHTTPRequestHandler):
             provided = authorization[7:].strip()
         if not provided:
             provided = self.headers.get('X-Cooler-Btop-Token')
-        if not provided:
+        if not provided and allow_query_token:
             provided = self._query_token()
         if not provided:
             provided = self._cookie_token()
-        return bool(provided) and hmac.compare_digest(str(provided), str(expected))
+        return _auth_token_matches(provided, expected)
 
     def _authorization_failure(self):
         self._respond(
@@ -544,8 +727,13 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self._respond(404, b'{"status":"error","message":"Not found"}')
 
     def do_GET(self):
-        path = urlsplit(self.path).path
-        if not self._authorized():
+        try:
+            path = urlsplit(self.path).path
+        except ValueError:
+            self._respond(400, b'{"status":"error","message":"Invalid request target"}',
+                          headers={'Cache-Control': 'no-store'})
+            return
+        if not self._authorized(allow_query_token=path in self.assets):
             self._authorization_failure()
             return
         if path in self.assets:
@@ -562,7 +750,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
             else:
                 headers = {}
                 query_token = self._query_token()
-                if getattr(self.server, 'auth_token', None) and query_token:
+                if _auth_token_matches(query_token, getattr(self.server, 'auth_token', None)):
                     # Native EventSource cannot set Authorization headers. A
                     # valid dashboard URL token can therefore be exchanged for
                     # a same-origin HttpOnly cookie before the stream starts.
@@ -570,6 +758,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
                         'cooler_btop_token=' + quote(query_token, safe='')
                         + '; Path=/; HttpOnly; SameSite=Strict'
                     )
+                headers['Cache-Control'] = 'no-store'
                 self._respond(200, payload, content_type, headers=headers)
 
         elif path == '/api/metrics':
@@ -605,13 +794,15 @@ class MetricsHandler(BaseHTTPRequestHandler):
             try:
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
-                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Cache-Control', 'no-store')
                 self.send_header('Connection', 'close')
                 self.send_header('X-Accel-Buffering', 'no')
                 self.send_header('Retry-After', self.server._retry_after_header())
-                self.send_header('X-Content-Type-Options', 'nosniff')
-                self.send_header('X-Frame-Options', 'DENY')
-                self.send_header('Referrer-Policy', 'no-referrer')
+                for name, value in SECURITY_HEADERS.items():
+                    if name not in {
+                        'Content-Type', 'Content-Length', 'Cache-Control',
+                    }:
+                        self.send_header(name, value)
                 self.end_headers()
                 version = 0
                 stale_deadline = time.monotonic() + self.server._snapshot_stale_after()
@@ -714,6 +905,10 @@ def run_server(
         collector = DataCollector()
         if auth_token is None:
             auth_token = os.environ.get('COOLER_BTOP_AUTH_TOKEN')
+        if auth_token is None:
+            token_file = os.environ.get(AUTH_FILE_ENV)
+            if token_file:
+                auth_token = read_auth_token_file(token_file)
         if db_path:
             logger = DBLogger(
                 db_path,

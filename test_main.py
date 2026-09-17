@@ -1,5 +1,7 @@
 import io
+import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -128,6 +130,23 @@ class TestCli(unittest.TestCase):
             auth_token='secret', privacy_mode=True, log_retention=42,
         )
 
+    def test_daemon_reads_auth_token_from_private_file(self):
+        from cooler_btop.main import run_cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'auth-token')
+            with open(path, 'w', encoding='utf-8') as token_file:
+                token_file.write('file-secret\n')
+            os.chmod(path, 0o600)
+            with patch.object(
+                sys, 'argv', ['cooler-btop', '--daemon', '--auth-token-file', path],
+            ), patch('cooler_btop.server.run_server', return_value=0) as run_server:
+                self.assertEqual(run_cli(), 0)
+        run_server.assert_called_once_with(
+            host='127.0.0.1', port=8080, db_path=None, interval=1.0,
+            auth_token='file-secret',
+        )
+
     def test_daemon_startup_exception_is_reported_as_cli_failure(self):
         stderr = io.StringIO()
         with patch.object(sys, 'argv', ['cooler-btop', '--daemon']), \
@@ -163,19 +182,23 @@ class TestCli(unittest.TestCase):
                 'cooler-btop', '--status', '--host', '127.0.0.2', '--port', '9090',
                 '--auth-token', 'secret',
             ],
-        ), patch('requests.get', return_value=response) as get:
+        ), patch('requests.Session') as session_factory:
+            session = session_factory.return_value
+            session.get.return_value = response
             from cooler_btop.main import run_cli
 
             self.assertEqual(run_cli(), 0)
-        get.assert_called_once_with(
+        self.assertFalse(session.trust_env)
+        session.get.assert_called_once_with(
             'http://127.0.0.2:9090/api/metrics',
             timeout=2,
             headers={'Authorization': 'Bearer secret'},
+            allow_redirects=False,
         )
 
     def test_status_returns_nonzero_when_daemon_is_unavailable(self):
         with patch.object(sys, 'argv', ['cooler-btop', '--status']), \
-                patch('requests.get', side_effect=OSError('offline')):
+                patch('requests.Session', side_effect=OSError('offline')):
             from cooler_btop.main import run_cli
 
             self.assertNotEqual(run_cli(), 0)

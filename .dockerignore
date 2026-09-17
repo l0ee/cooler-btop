@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+.venv*/
+.pytest_cache/
+.coverage
 dist/
 build/
 *.egg-info/
@@ -19,5 +22,8 @@ AGENT_RULES.md
 *.sqlite
 *.sqlite3
 *.db
+*.sqlite-*
+*.sqlite3-*
+*.db-*
 .env
 .env.*

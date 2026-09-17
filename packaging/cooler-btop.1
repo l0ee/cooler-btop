@@ -37,6 +37,10 @@ Limit SQLite history to the specified number of rows. The default is 100000.
 Require the specified Bearer token for daemon API requests. This is required
 when the bind address is not loopback.
 .TP
+.BR \-\-auth-token-file " " PATH
+Read the Bearer token from a regular file that is owner-readable only (mode
+0600). This avoids exposing the token in process listings and shell history.
+.TP
 .BR \-\-privacy-mode
 Replace process command arguments with process names in daemon API data.
 .TP

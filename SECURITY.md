@@ -20,16 +20,33 @@ through [GitHub private vulnerability reporting](https://github.com/l0ee/cooler-
 ### 1. Headless Daemon API (`--daemon`)
 The headless API binds to `127.0.0.1` by default. Its dashboard and HTTP API are
 read-only: they expose system metrics and do not provide process-control
-operations. A non-loopback bind is rejected unless `--auth-token` or
-`COOLER_BTOP_AUTH_TOKEN` is configured. API clients should send that value as a
-Bearer token. The dashboard accepts a `?token=` URL once and exchanges it for a
-same-origin HttpOnly cookie for its native SSE connection; protect such URLs
-and use TLS when the service is reachable beyond a trusted local network.
+operations. A non-loopback bind is rejected unless `--auth-token`,
+`--auth-token-file`, `COOLER_BTOP_AUTH_TOKEN`, or
+`COOLER_BTOP_AUTH_TOKEN_FILE` is configured. API clients should send that value
+as a Bearer token. The dashboard root accepts a `?token=` URL for browser
+bootstrap and exchanges a valid value for a same-origin HttpOnly cookie; query
+tokens are not accepted on API or SSE routes. Protect such URLs. Inline
+command-line tokens are visible in process listings and shell history, so a
+private token file (mode `0600`) or a secret-managed environment variable is
+preferred.
+
+The daemon serves plain HTTP and has no built-in TLS. Use a TLS reverse proxy,
+VPN, or SSH tunnel before making it reachable beyond a trusted local machine.
+Responses use a restrictive CSP and `no-store` cache controls. Access logs
+redact `token=` query values, but URL paths and other request metadata can
+still identify a client.
 
 Process command arguments can contain sensitive values. Use `--privacy-mode` to
 replace them with process names. SQLite logging is bounded to 100,000 rows by
 default; `--log-retention` can lower or raise that cap within its documented
-range.
+range. SQLite database files are created or tightened to mode `0600`, new
+parent directories use mode `0700`, and SQLite rollback/sidecar files should
+be protected with the same directory permissions.
+
+Process termination is local-only, limited to verified same-user snapshots,
+and uses pidfds when the running Python/Linux build provides both pidfd APIs.
+It is refused when `HOST_PROC` points outside the current PID namespace or
+when those APIs are unavailable; there is no unsafe `os.kill` fallback.
 
 ### 2. Container Scope
 The supplied Compose service runs as an unprivileged user with a read-only

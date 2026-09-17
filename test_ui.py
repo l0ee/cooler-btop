@@ -91,6 +91,10 @@ class SnapshotCollector:
         self.max_active = 0
         self.started = threading.Event()
         self.release = None
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
 
     def get_sys_info(self):
         self.calls += 1
@@ -351,6 +355,9 @@ class TerminalPilotTests(unittest.IsolatedAsyncioTestCase):
 
     async def settle(self, app, pilot):
         await app.workers.wait_for_complete()
+        sampler = getattr(app, '_sample_thread', None)
+        if sampler is not None:
+            await asyncio.to_thread(sampler.join, 5)
         await pilot.pause()
 
     def row_pids(self, app):
@@ -538,6 +545,19 @@ class TerminalPilotTests(unittest.IsolatedAsyncioTestCase):
             await self.settle(app, pilot)
             await pilot.press('q')
             self.assertFalse(app.is_running)
+        self.assertEqual(app.collector.close_calls, 1)
+
+    async def test_termination_fails_safely_without_pidfd_apis(self):
+        app = self.make_app(show_pet=False)
+        with patch('cooler_btop.main.os.pidfd_open', None, create=True), \
+                patch('cooler_btop.main.signal.pidfd_send_signal', None, create=True), \
+                patch('cooler_btop.main._proc_root_is_current_namespace', return_value=True), \
+                patch.object(app, 'notify') as notify:
+            async with app.run_test(size=(80, 24)) as pilot:
+                await self.settle(app, pilot)
+                app._terminate_process(303, os.getuid(), 1303, True)
+                notify.assert_called_once()
+                self.assertIn('unavailable', notify.call_args.args[0])
 
     async def test_empty_devices_clear_old_rows_and_multiple_gpus_remain_reachable(self):
         app = self.make_app(show_pet=False)
@@ -618,7 +638,8 @@ class TerminalPilotTests(unittest.IsolatedAsyncioTestCase):
         process.memory_percent.return_value = 2.0
         process.memory_info.return_value = SimpleNamespace(rss=1024 ** 2)
         process.net_connections.return_value = []
-        with patch('cooler_btop.ui.psutil.Process', return_value=process):
+        with patch('cooler_btop.ui.psutil.Process', return_value=process), \
+                patch('cooler_btop.main._read_process_identity', return_value=(os.getuid(), 1303)):
             async with app.run_test(size=(80, 24)) as pilot:
                 await self.settle(app, pilot)
                 await pilot.press('h')

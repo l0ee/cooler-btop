@@ -96,7 +96,7 @@ class FastTelemetry:
                     try:
                         stream.close()
                     except Exception:
-                        pass
+                        pass  # nosec B110
             self._stat_file = None
             self._mem_file = None
         else:
@@ -841,13 +841,13 @@ class FastTelemetry:
             try:
                 stream.close()
             except Exception:
-                pass
+                pass  # nosec B110
 
     def __del__(self):
         try:
             self.close()
         except Exception:
-            pass
+            pass  # nosec B110
 
     def get_cpu_percent(self):
         if not self._stat_file:

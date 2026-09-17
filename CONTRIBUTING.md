@@ -86,10 +86,14 @@ must have passing CI and an approving review before it is merged to `main`.
    git push origin vX.Y.Z
    ```
 
-4. Confirm the tag matches the project version. The release workflow builds
-   the RPM, source RPM, wheel, source archive, and checksum manifest, creates
-   a signed GitHub artifact attestation from that manifest, then publishes only
-   those verified artifacts. A downloaded release artifact can be checked with
+4. Confirm the tag matches the project version. The release workflow rejects
+   unprotected or lightweight tags and tags outside reviewed `main` history,
+   builds the RPM, source RPM, wheel, source archive, and checksum manifest,
+   creates a signed GitHub artifact attestation from that manifest, then
+   publishes only those verified artifacts. The workflow does not have a
+   maintainer signing key and cannot verify a tag signature itself; protect
+   `v*` tags and perform `git tag -v` before pushing. A downloaded release
+   artifact can be checked with
    `gh attestation verify ARTIFACT --repo l0ee/cooler_btop`.
 
 If a published commit is wrong, use a reviewed `git revert` on `main` and
@@ -99,10 +103,14 @@ history to repair a release.
 ## Maintainer settings
 
 Repository administrators should protect `main` with pull-request reviews,
-required CI status checks, stale-review dismissal, and force-push/deletion
-disabled. Require signed commits or otherwise verify the release tag. Keep
-third-party GitHub Actions pinned to full commit SHAs and update those pins by
-reviewed pull request.
+at least one code-owner approval, required CI status checks, stale-review
+dismissal, conversation resolution, and force-push/deletion disabled. Protect
+`v*` tags from creation/update/deletion except for release maintainers, require
+signed release tags, and use a reviewed release environment for publication.
+Keep third-party GitHub Actions pinned to full commit SHAs and update those
+pins by reviewed pull request. The repository files can express CODEOWNERS and
+Dependabot policy, but branch/ruleset and environment settings are GitHub-side
+controls that must be verified by an administrator.
 
 The daemon binds to loopback by default. Any deployment that widens its bind
 address must provide access control and transport security outside this

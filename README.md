@@ -6,9 +6,11 @@ based on Fedora 44.
 
 ## Fedora/Nobara 44 Desktop Installation
 
-The first RPM is checksummed but unsigned. These commands download the Fedora
-44 binary RPM and `SHA256SUMS` from the same GitHub release, verify only the
-downloaded RPM's exact manifest entry, and install it with DNF:
+The first RPM is checksummed but unsigned. The v2.0.0 tag predates the current
+release hardening, so verify the exact `SHA256SUMS` entry as shown below and do
+not treat that RPM as cryptographically authenticated. These commands download the
+Fedora 44 binary RPM and `SHA256SUMS` from the same GitHub release, verify only
+the downloaded RPM's exact manifest entry, and install it with DNF:
 
 ```bash
 curl --fail --location --remote-name "https://github.com/l0ee/cooler-btop/releases/download/v2.0.0/cooler-btop-2.0.0-1.fc44.noarch.rpm" &&
@@ -17,9 +19,11 @@ awk '$2 == "cooler-btop-2.0.0-1.fc44.noarch.rpm" { print }' SHA256SUMS | sha256s
 sudo dnf install ./cooler-btop-2.0.0-1.fc44.noarch.rpm
 ```
 
-Tagged releases also publish a GitHub artifact attestation covering every file
+New tagged releases publish a GitHub artifact attestation covering every file
 listed in `SHA256SUMS`; maintainer verification instructions are in
-`CONTRIBUTING.md`.
+`CONTRIBUTING.md`. Release tags must be protected signed annotated tags; the
+workflow rejects unprotected or lightweight tags and tags outside reviewed
+`main` history, but cannot verify a maintainer's local key.
 
 Launch **Cooler btop** from the desktop application grid or run
 `cooler-btop` in a terminal. Press `q` to exit. The RPM installs
@@ -89,8 +93,9 @@ docker compose up --build
 This starts the read-only dashboard on
 `http://127.0.0.1:8080/?token=$COOLER_BTOP_AUTH_TOKEN`. The token in the URL is
 exchanged for an HttpOnly same-origin cookie so the browser's native SSE client
-can authenticate. Treat that URL as a secret; for scripted API access, prefer
-an `Authorization: Bearer ...` header. The daemon binds `0.0.0.0` inside the
+can authenticate. The query token is accepted only on the dashboard root, not
+on API or SSE routes. Treat that URL as a secret; for scripted API access,
+prefer an `Authorization: Bearer ...` header. The daemon binds `0.0.0.0` inside the
 container so the published port works, but Compose exposes it only on the host
 loopback interface. The container runs without host PID mode, host `/proc` or
 `/sys` mounts, blanket privileges, or Linux capabilities. Its metrics describe
@@ -98,7 +103,13 @@ the container's process and resource namespace, not the host.
 
 Outside the container, daemon mode binds to `127.0.0.1` by default. If you bind
 it to another interface, provide `--auth-token` (or
-`COOLER_BTOP_AUTH_TOKEN`) and apply network access controls because metrics may
-include host and process information. Use `--privacy-mode` to replace process
-command arguments with process names, and `--log-retention N` to cap SQLite
-history at N rows.
+`--auth-token-file`, `COOLER_BTOP_AUTH_TOKEN`, or
+`COOLER_BTOP_AUTH_TOKEN_FILE`) and apply network access controls because
+metrics may include host and process information. Inline `--auth-token` values
+are visible in shell history and process listings; prefer the file option with
+mode `0600` or an environment variable supplied by a secret manager. The
+daemon serves plain HTTP and has no built-in TLS, so use a TLS reverse proxy,
+VPN, or SSH tunnel before exposing it beyond a trusted local machine. Use
+`--privacy-mode` to replace process command arguments with process names, and
+`--log-retention N` to cap SQLite history at N rows. SQLite metric files are
+created owner-readable only (`0600`); keep their parent directory private too.

@@ -3,10 +3,10 @@ import math
 import os
 import signal
 import sys
+import threading
 from copy import deepcopy
 
 from rich.text import Text
-from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, VerticalScroll
@@ -101,6 +101,34 @@ def _read_process_identity(pid):
         return uid, int(fields[19])
     except (OSError, ValueError):
         return None
+
+
+def _proc_root_is_current_namespace():
+    """Allow PID signaling only when identity reads use this PID namespace."""
+    configured = os.environ.get('HOST_PROC')
+    if configured is None:
+        return True
+    if not configured:
+        return False
+    try:
+        return os.path.realpath(configured) == os.path.realpath('/proc')
+    except OSError:
+        return False
+
+
+def _resolve_auth_token(explicit=None, file_path=None):
+    """Resolve CLI, file, and environment token sources without printing them."""
+    if explicit is not None:
+        return explicit
+    from .server import AUTH_FILE_ENV, read_auth_token_file
+
+    if file_path:
+        return read_auth_token_file(file_path)
+    token = os.environ.get('COOLER_BTOP_AUTH_TOKEN')
+    if token is not None:
+        return token
+    environment_path = os.environ.get(AUTH_FILE_ENV)
+    return read_auth_token_file(environment_path) if environment_path else None
 
 CSS = """
 $bg: #0b1014;
@@ -230,6 +258,11 @@ class BtopCloneApp(App):
         self.paused = False
         self._sampling = False
         self._generation = 0
+        self._sample_cancel = threading.Event()
+        self._sample_thread = None
+        self._closed = False
+        self._collector_closed = False
+        self._collector_lock = threading.Lock()
         self._process_snapshot = []
         self.last_sample = None
         self.sample_error = ""
@@ -289,6 +322,36 @@ class BtopCloneApp(App):
         self.update_stats()
         self._stats_timer = self.set_interval(self.refresh_interval, self.update_stats)
 
+    def on_unmount(self) -> None:
+        """Stop UI scheduling and release telemetry resources on every exit."""
+        self._closed = True
+        self._generation += 1
+        self._sample_cancel.set()
+        timer = getattr(self, '_stats_timer', None)
+        if timer is not None:
+            timer.stop()
+        sampler = self._sample_thread
+        # Do not close a collector while its worker may still be inside a
+        # backend call. A blocked worker is daemonized and will release OS
+        # resources with the process; a completed worker closes it below.
+        if sampler is None or not sampler.is_alive():
+            self._close_collector()
+
+    def _close_collector(self):
+        with self._collector_lock:
+            if self._collector_closed or self.collector is None:
+                return
+            self._collector_closed = True
+            collector = self.collector
+        close = getattr(collector, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # UI shutdown must remain best-effort even if a platform
+                # telemetry backend has already disappeared.
+                pass  # nosec B110
+
     def on_resize(self, event):
         if hasattr(self, "context"):
             self._set_layout(event.size.width)
@@ -304,38 +367,76 @@ class BtopCloneApp(App):
             if not self.paused:
                 self._show_replay(self.replay_index + 1)
             return
-        # Cancelling a Textual thread worker does not stop its collector calls.
-        # Admit only one sample; presentation changes never launch another worker.
-        if self.paused or self._sampling:
+        # Admit only one sample; presentation changes never launch another
+        # worker. The daemon thread is deliberately independent of Textual's
+        # executor so a blocked collector cannot keep interpreter shutdown
+        # alive.
+        if self._closed or self.paused or self._sampling:
             return
         self._sampling = True
-        self._sample_stats(self._generation)
+        self._sample_cancel.clear()
+        self._sample_thread = threading.Thread(
+            target=self._sample_stats,
+            args=(self._generation,),
+            name='tui-telemetry-sampler',
+            daemon=True,
+        )
+        self._sample_thread.start()
 
-    @work(thread=True, group="telemetry", exit_on_error=False)
+    def _sample_cancelled(self, generation):
+        return (
+            self._closed
+            or self._sample_cancel.is_set()
+            or generation != self._generation
+        )
+
     def _sample_stats(self, generation):
         snapshot, error = None, ""
+
+        def finish_sample():
+            try:
+                self.call_from_thread(self._finish_sample, generation, snapshot, error)
+            except RuntimeError:
+                pass  # nosec B110
+
         try:
-            if self.collector is None:
-                self.collector = DataCollector()
+            if self._sample_cancelled(generation):
+                if self._closed:
+                    self._close_collector()
+                finish_sample()
+                return
+            with self._collector_lock:
+                if self.collector is None:
+                    self.collector = DataCollector()
+                collector = self.collector
+            if self._sample_cancelled(generation):
+                if self._closed:
+                    self._close_collector()
+                finish_sample()
+                return
             snapshot = {
-                "sys": self.collector.get_sys_info(),
-                "cpu": self.collector.get_cpu(),
-                "mem": self.collector.get_mem(),
-                "gpu": self.collector.get_gpu(),
-                "disk": self.collector.get_disk(),
-                "net": self.collector.get_net(),
-                "conns": self.collector.get_connections(),
-                "procs": self.collector.get_procs(tree=False, limit=None),
+                "sys": collector.get_sys_info(),
+                "cpu": collector.get_cpu(),
+                "mem": collector.get_mem(),
+                "gpu": collector.get_gpu(),
+                "disk": collector.get_disk(),
+                "net": collector.get_net(),
+                "conns": collector.get_connections(),
+                "procs": collector.get_procs(tree=False, limit=None),
             }
+            if self._sample_cancelled(generation):
+                snapshot = None
         except Exception as exc:
+            snapshot = None
             error = f"{type(exc).__name__}: {exc}"
-        try:
-            self.call_from_thread(self._finish_sample, generation, snapshot, error)
-        except RuntimeError:
-            pass  # The app may have closed while a sample was in flight.
+        if self._closed:
+            self._close_collector()
+        finish_sample()
 
     def _finish_sample(self, generation, snapshot, error):
         self._sampling = False
+        if self._closed:
+            return
         if generation != self._generation or self.paused or self.replay_index is not None:
             if not self.paused and self.replay_index is None:
                 self.call_later(self.update_stats)
@@ -391,6 +492,7 @@ class BtopCloneApp(App):
             self.capture = []
             # Samples already in flight belong to the preceding time window.
             self._generation += 1
+            self._sample_cancel.set()
             self.notify("Recording started (up to 300 samples). r stops; e replays.")
         self._update_context()
 
@@ -400,6 +502,7 @@ class BtopCloneApp(App):
             return
         self.recording = False
         self._generation += 1
+        self._sample_cancel.set()
         self.paused = False
         self.sample_error = ""
         self._show_replay(0)
@@ -439,6 +542,7 @@ class BtopCloneApp(App):
         self.replay_index = None
         self.paused = False
         self._generation += 1
+        self._sample_cancel.set()
         self._clear_graphs()
         self.last_sample = None
         if self.show_pet:
@@ -505,6 +609,8 @@ class BtopCloneApp(App):
     def action_toggle_pause(self):
         self.paused = not self.paused
         self._generation += 1
+        if self.paused:
+            self._sample_cancel.set()
         if self.show_pet:
             self.pet.paused = self.paused
         self._update_context()
@@ -567,19 +673,36 @@ class BtopCloneApp(App):
         if pid == 1 or pid == os.getpid() or expected_uid != os.getuid() or expected_start_time is None:
             self.notify("Process identity is not safe to terminate.", severity="error")
             return
+        if not _proc_root_is_current_namespace():
+            self.notify(
+                "Process termination is disabled when HOST_PROC is outside this PID namespace.",
+                severity="error",
+            )
+            return
+        pidfd_open = getattr(os, 'pidfd_open', None)
+        pidfd_send_signal = getattr(signal, 'pidfd_send_signal', None)
+        if not callable(pidfd_open) or not callable(pidfd_send_signal):
+            self.notify(
+                "Process termination is unavailable on this Python/Linux build; no signal was sent.",
+                severity="error",
+            )
+            return
         pidfd = None
         try:
-            pidfd = os.pidfd_open(pid)
+            pidfd = pidfd_open(pid)
             if _read_process_identity(pid) != (expected_uid, expected_start_time):
                 self.notify("Process changed or exited; no signal was sent.", severity="error")
                 return
-            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            pidfd_send_signal(pidfd, signal.SIGTERM)
             self.notify(f"Sent SIGTERM to PID {pid}")
-        except OSError as error:
+        except (AttributeError, OSError, ValueError) as error:
             self.notify(f"Could not terminate PID {pid}: {error}", severity="error")
         finally:
             if pidfd is not None:
-                os.close(pidfd)
+                try:
+                    os.close(pidfd)
+                except OSError:
+                    pass
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table is self.proc.dt:
@@ -588,7 +711,19 @@ class BtopCloneApp(App):
                 return
             pid = int(event.row_key.value)
             if pid > 0:
-                self.push_screen(ProcDetailsModal(pid))
+                process = next(
+                    (item for item in self._process_snapshot if item.get('pid') == pid),
+                    None,
+                )
+                if process is None:
+                    self.notify("Process changed or exited; details are unavailable.")
+                    return
+                self.push_screen(ProcDetailsModal(
+                    pid,
+                    expected_uid=process.get('uid'),
+                    expected_start_time=process.get('start_time'),
+                    identity_reader=_read_process_identity,
+                ))
 
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected):
         if event.data_table is self.proc.dt:
@@ -676,9 +811,17 @@ def run_cli():
         "--log-retention", type=_validate_log_retention, default=None,
         help="Maximum number of SQLite metric rows to retain",
     )
-    parser.add_argument(
+    token_options = parser.add_mutually_exclusive_group()
+    token_options.add_argument(
         "--auth-token", default=None,
-        help="Bearer token for the daemon API; required for non-loopback binds",
+        help=(
+            "Bearer token for the daemon API; required for non-loopback binds "
+            "(visible in process listings and shell history)"
+        ),
+    )
+    token_options.add_argument(
+        "--auth-token-file", default=None, metavar="PATH",
+        help="Read the daemon token from an owner-readable-only file (mode 0600)",
     )
     parser.add_argument(
         "--privacy-mode", "--mask-process-args", action="store_true",
@@ -693,14 +836,31 @@ def run_cli():
     parser.add_argument("--status", action="store_true", help="Query the local daemon and print a CLI status summary")
     args = parser.parse_args()
 
+    if args.daemon or args.status:
+        try:
+            args.auth_token = _resolve_auth_token(
+                args.auth_token, args.auth_token_file,
+            )
+        except ValueError as error:
+            parser.error(str(error))
+
     if args.status:
         try:
             import requests
             request_options = {'timeout': 2}
-            token = args.auth_token or os.environ.get('COOLER_BTOP_AUTH_TOKEN')
+            token = args.auth_token
             if token:
                 request_options['headers'] = {'Authorization': f'Bearer {token}'}
-            r = requests.get(_status_url(args.host, args.port), **request_options)
+            session = requests.Session()
+            session.trust_env = False
+            try:
+                r = session.get(
+                    _status_url(args.host, args.port),
+                    allow_redirects=False,
+                    **request_options,
+                )
+            finally:
+                session.close()
             if r.status_code == 200:
                 data = r.json()
                 print(f"Cooler Btop Daemon: ONLINE (Port {args.port})")
@@ -710,7 +870,7 @@ def run_cli():
             else:
                 print(f"Daemon returned status code {r.status_code}")
                 return 1
-        except Exception as e:
+        except Exception:
             print("Daemon is offline or unreachable. Start it with `cooler-btop --daemon`.")
             return 1
 

@@ -612,10 +612,29 @@ class HelpModal(DismissibleModal):
             yield Button("Close", id="close-help", classes="cancel")
 
 
+class _ProcessIdentityChanged(Exception):
+    """Internal marker used when a PID no longer identifies the same process."""
+
+
 class ProcDetailsModal(DismissibleModal):
-    def __init__(self, pid: int, **kwargs):
+    def __init__(
+        self, pid: int, *, expected_uid=None, expected_start_time=None,
+        identity_reader=None, **kwargs,
+    ):
         super().__init__(**kwargs)
         self.pid = pid
+        self.expected_uid = expected_uid
+        self.expected_start_time = expected_start_time
+        self.identity_reader = identity_reader
+
+    def _identity_matches(self):
+        if self.identity_reader is None:
+            return True
+        try:
+            identity = self.identity_reader(self.pid)
+        except (OSError, ValueError, TypeError):
+            return False
+        return identity == (self.expected_uid, self.expected_start_time)
 
     def compose(self):
         with Vertical(classes="dialog", id="details-dialog"):
@@ -632,6 +651,8 @@ class ProcDetailsModal(DismissibleModal):
     def load_details(self):
         text = Text(style=TEXT)
         try:
+            if not self._identity_matches():
+                raise _ProcessIdentityChanged
             process = psutil.Process(self.pid)
             with process.oneshot():
                 for label, read in [
@@ -653,12 +674,19 @@ class ProcDetailsModal(DismissibleModal):
                         value = "Unavailable"
                     text.append(f"{label:<12}", style=MUTED)
                     text.append(f"{value}\n")
+            if not self._identity_matches():
+                raise _ProcessIdentityChanged
+        except _ProcessIdentityChanged:
+            text = Text(
+                "Process changed or exited; details are unavailable.",
+                style=AMBER,
+            )
         except (psutil.Error, OSError, ValueError) as error:
             text.append(f"Process unavailable: {error}", style=AMBER)
         try:
             self.app.call_from_thread(self._show_details, text)
         except RuntimeError:
-            pass  # The app may have closed while the worker was reading.
+            pass  # nosec B110
 
     def _show_details(self, text):
         if self.is_mounted:

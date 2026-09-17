@@ -562,7 +562,11 @@ assert sys.argv[1:] == ["dnf", "install", "./cooler-btop-2.0.0-1.fc44.noarch.rpm
         )
         for document in (readme, security):
             self.assertNotRegex(document, r"(?i)\bsupport(?:ed|s)? (?:all|any) linux\b")
-            self.assertNotRegex(document, r"(?i)\bsigned\b")
+            self.assertNotRegex(
+                document,
+                r"(?i)\b(?:rpm|package)\b[^.]{0,80}\bsigned\b",
+            )
+        self.assertIn("signed annotated tags", readme)
 
     def test_build_metadata_supports_fedora_setuptools_and_textual(self):
         metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -583,7 +587,12 @@ assert sys.argv[1:] == ["dnf", "install", "./cooler-btop-2.0.0-1.fc44.noarch.rpm
         native_files = []
         generated_dirs = {".git", "build", "dist", "__pycache__"}
         for path in ROOT.rglob("*"):
-            if not path.is_file() or generated_dirs.intersection(path.relative_to(ROOT).parts):
+            relative_parts = path.relative_to(ROOT).parts
+            if (
+                not path.is_file()
+                or generated_dirs.intersection(relative_parts)
+                or any(part.startswith(".venv") for part in relative_parts)
+            ):
                 continue
             if find_native_members({path.name}) or has_native_magic(path.read_bytes()[:8]):
                 native_files.append(path.relative_to(ROOT).as_posix())
@@ -732,11 +741,17 @@ class DistributionTests(unittest.TestCase):
             "packaging/verify-rpm.sh",
             ".github/workflows/ci.yml",
             ".github/workflows/release.yml",
+            ".github/workflows/security.yml",
+            ".github/CODEOWNERS",
+            ".github/dependabot.yml",
+            ".github/pull_request_template.md",
             ".dockerignore",
             "Dockerfile",
             "docker-compose.yml",
             "Makefile",
             "requirements.txt",
+            "requirements.lock",
+            "CONTRIBUTING.md",
             "SECURITY.md",
         }
         relative_names = {name.removeprefix(f"{expected_root}/") for name in names}
@@ -1277,7 +1292,10 @@ class LinuxPackagingTests(unittest.TestCase):
         )
         fedora_job = workflow["jobs"]["fedora-release"]
         self.assertEqual(fedora_job["timeout-minutes"], 30)
-        self.assertEqual(fedora_job["container"], "fedora:44")
+        self.assertEqual(
+            fedora_job["container"],
+            "fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80",
+        )
         dependencies = named_step(fedora_job, "Install Fedora build dependencies")["run"]
         for dependency in (
             "appstream",
@@ -1328,7 +1346,10 @@ class LinuxPackagingTests(unittest.TestCase):
         self.assertEqual(set(workflow["jobs"]), {"build", "publish"})
         build = workflow["jobs"]["build"]
         publish = workflow["jobs"]["publish"]
-        self.assertEqual(build["container"], "fedora:44")
+        self.assertEqual(
+            build["container"],
+            "fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80",
+        )
         self.assertEqual(build["timeout-minutes"], 30)
         self.assertEqual(build["permissions"], {
             "contents": "read",
@@ -1342,6 +1363,13 @@ class LinuxPackagingTests(unittest.TestCase):
         tag_check = named_step(build, "Require tag to match project version")["run"]
         self.assertIn('expected_tag="v$(python3 -c', tag_check)
         self.assertIn('test "$GITHUB_REF_NAME" = "$expected_tag"', tag_check)
+        self.assertIn('test "${GITHUB_REF_PROTECTED:-false}" = true', tag_check)
+        self.assertIn("%(objecttype)", tag_check)
+        self.assertIn('test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$GITHUB_SHA"', tag_check)
+        self.assertIn(
+            'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main',
+            tag_check,
+        )
         self.assertEqual(
             build["outputs"]["version"],
             "${{ steps.project_version.outputs.version }}",
@@ -1395,7 +1423,7 @@ class LinuxPackagingTests(unittest.TestCase):
         self.assertNotIn("*", release_command)
 
     def test_workflows_pin_every_github_action_to_a_known_commit(self):
-        for workflow_name in ("ci.yml", "release.yml"):
+        for workflow_name in ("ci.yml", "release.yml", "security.yml"):
             workflow = load_workflow(workflow_name)
             for job_name, job in workflow["jobs"].items():
                 for step in job["steps"]:

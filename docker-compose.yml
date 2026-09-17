@@ -4,6 +4,8 @@ services:
     container_name: cooler_btop_daemon
     ports:
       - "127.0.0.1:8080:8080"
+    environment:
+      COOLER_BTOP_AUTH_TOKEN: ${COOLER_BTOP_AUTH_TOKEN:?Set COOLER_BTOP_AUTH_TOKEN before starting the dashboard}
     read_only: true
     tmpfs:
       - /tmp:size=16m,noexec,nosuid,nodev
@@ -13,7 +15,7 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/metrics', timeout=5).read(1)"]
+      test: ["CMD", "python", "-c", "import os, urllib.request; request = urllib.request.Request('http://127.0.0.1:8080/api/metrics', headers={'Authorization': 'Bearer ' + os.environ['COOLER_BTOP_AUTH_TOKEN']}); urllib.request.urlopen(request, timeout=5).read(1)"]
       interval: 30s
       timeout: 6s
       retries: 3

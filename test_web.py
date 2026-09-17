@@ -1,6 +1,9 @@
 from html.parser import HTMLParser
 import pathlib
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 from cooler_btop.server import MetricsHandler
@@ -67,9 +70,30 @@ class WebSafetyTests(unittest.TestCase):
 
         self.assertIn("<canvas", source)
         self.assertIn("getContext('2d')", source)
-        self.assertIn('new EventSource("/api/metrics/stream")', source)
+        self.assertIn("new EventSource(streamPath, {withCredentials: true})", source)
+        self.assertIn("const streamPath = '/api/metrics/stream';", source)
+        self.assertIn("window.history.replaceState", source)
+        self.assertIn("addEventListener('stale'", source)
         self.assertNotIn("fetch(", source)
         self.assertNotRegex(source, r"/api/(?:kill|terminate)")
+
+    def test_dashboard_script_passes_javascript_syntax_check_when_node_exists(self):
+        node = shutil.which('node')
+        if node is None:
+            self.skipTest('node is not installed')
+        source = (WEB_ROOT / 'index.html').read_text(encoding='utf-8')
+        script = re.search(r'(?s)<script>\s*(.*?)\s*</script>', source)
+        self.assertIsNotNone(script)
+        with tempfile.NamedTemporaryFile('w', suffix='.js', encoding='utf-8') as file:
+            file.write(script.group(1))
+            file.flush()
+            result = subprocess.run(
+                [node, '--check', file.name],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_server_exposes_only_the_packaged_dashboard_asset(self):
         self.assertEqual(

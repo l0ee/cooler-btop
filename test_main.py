@@ -110,6 +110,69 @@ class TestCli(unittest.TestCase):
             host='127.0.0.1', port=8080, db_path=None, interval=1.0,
         )
 
+    def test_daemon_forwards_auth_privacy_and_retention_options(self):
+        with patch.object(
+            sys,
+            'argv',
+            [
+                'cooler-btop', '--daemon', '--host', '0.0.0.0', '--port', '9090',
+                '--interval', '0.2', '--log-db', 'metrics.sqlite',
+                '--log-retention', '42', '--auth-token', 'secret', '--privacy-mode',
+            ],
+        ), patch('cooler_btop.server.run_server', return_value=0) as run_server:
+            from cooler_btop.main import run_cli
+
+            self.assertEqual(run_cli(), 0)
+        run_server.assert_called_once_with(
+            host='0.0.0.0', port=9090, db_path='metrics.sqlite', interval=0.2,
+            auth_token='secret', privacy_mode=True, log_retention=42,
+        )
+
+    def test_daemon_startup_exception_is_reported_as_cli_failure(self):
+        stderr = io.StringIO()
+        with patch.object(sys, 'argv', ['cooler-btop', '--daemon']), \
+                patch('cooler_btop.server.run_server', side_effect=OSError('bind failed')), \
+                patch.object(sys, 'stderr', stderr):
+            from cooler_btop.main import run_cli
+
+            self.assertEqual(run_cli(), 1)
+        self.assertIn('OSError: bind failed', stderr.getvalue())
+        self.assertIn('bind address, port', stderr.getvalue())
+
+    def test_invalid_network_and_interval_options_are_rejected(self):
+        from cooler_btop import main
+
+        for option, value in (('--port', '0'), ('--port', '65536'), ('--interval', '0.01')):
+            with self.subTest(option=option, value=value), \
+                    patch.object(sys, 'argv', ['cooler-btop', '--daemon', option, value]):
+                with self.assertRaises(SystemExit) as error:
+                    main.run_cli()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_status_uses_requested_host_port_and_authentication(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            'sys': {'hostname': 'test-host', 'uptime': '1h'},
+            'cpu': {'total': 12.5},
+            'mem': {'mem': {'percent': 34.0}},
+        }
+        with patch.object(
+            sys,
+            'argv',
+            [
+                'cooler-btop', '--status', '--host', '127.0.0.2', '--port', '9090',
+                '--auth-token', 'secret',
+            ],
+        ), patch('requests.get', return_value=response) as get:
+            from cooler_btop.main import run_cli
+
+            self.assertEqual(run_cli(), 0)
+        get.assert_called_once_with(
+            'http://127.0.0.2:9090/api/metrics',
+            timeout=2,
+            headers={'Authorization': 'Bearer secret'},
+        )
+
     def test_status_returns_nonzero_when_daemon_is_unavailable(self):
         with patch.object(sys, 'argv', ['cooler-btop', '--status']), \
                 patch('requests.get', side_effect=OSError('offline')):

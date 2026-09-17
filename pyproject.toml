@@ -8,16 +8,17 @@ version = "2.0.0"
 description = "A Linux system monitor with terminal and local web interfaces"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "l0ee"}
 ]
 dependencies = [
     "textual>=4.0,<9",
-    "rich",
+    "rich>=13,<15",
     "psutil>=5.9.0",
-    "requests"
+    "requests>=2.31,<3"
 ]
+
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -25,6 +26,13 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: System :: Monitoring",
+]
+
+[project.optional-dependencies]
+test = [
+    "PyYAML>=6.0,<7",
+    "coverage>=7,<8",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]

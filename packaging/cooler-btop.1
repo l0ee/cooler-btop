@@ -30,6 +30,16 @@ Set the web server port. The default is 8080.
 .BR \-\-log-db " " PATH
 Write daemon metrics to the specified SQLite database.
 .TP
+.BR \-\-log-retention " " ROWS
+Limit SQLite history to the specified number of rows. The default is 100000.
+.TP
+.BR \-\-auth-token " " TOKEN
+Require the specified Bearer token for daemon API requests. This is required
+when the bind address is not loopback.
+.TP
+.BR \-\-privacy-mode
+Replace process command arguments with process names in daemon API data.
+.TP
 .BR \-\-interval " " SECONDS
 Set the telemetry update interval. The default is 1.0 second.
 .TP

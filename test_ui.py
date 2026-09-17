@@ -560,8 +560,8 @@ class TerminalPilotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_termination_defaults_to_cancel_and_requires_positive_pid(self):
         app = self.make_app(show_pet=False)
-        with patch('cooler_btop.main.os.pidfd_open', return_value=55) as pidfd_open, \
-                patch('cooler_btop.main.signal.pidfd_send_signal') as pidfd_send, \
+        with patch('cooler_btop.main.os.pidfd_open', return_value=55, create=True) as pidfd_open, \
+                patch('cooler_btop.main.signal.pidfd_send_signal', create=True) as pidfd_send, \
                 patch('cooler_btop.main.os.close'), \
                 patch('cooler_btop.main._read_process_identity', return_value=(os.getuid(), 1303)):
             async with app.run_test(size=(80, 24)) as pilot:
@@ -593,8 +593,8 @@ class TerminalPilotTests(unittest.IsolatedAsyncioTestCase):
         app = self.make_app(show_pet=False)
         async with app.run_test(size=(80, 24)) as pilot:
             await self.settle(app, pilot)
-            with patch('cooler_btop.main.os.pidfd_open', return_value=56) as pidfd_open, \
-                    patch('cooler_btop.main.signal.pidfd_send_signal') as pidfd_send, \
+            with patch('cooler_btop.main.os.pidfd_open', return_value=56, create=True) as pidfd_open, \
+                    patch('cooler_btop.main.signal.pidfd_send_signal', create=True) as pidfd_send, \
                     patch('cooler_btop.main.os.close'):
                 for identity in ((os.getuid() + 1, 1303), (os.getuid(), 9999), None):
                     with self.subTest(identity=identity), \

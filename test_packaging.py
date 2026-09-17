@@ -56,6 +56,25 @@ test "$query_status" -eq 1
 test "$query_output" = "package cooler-btop is not installed"'''
 
 
+def workflow_release_paths(version_expression):
+    return [
+        f"dist/cooler-btop-{version_expression}-1.fc44.noarch.rpm",
+        f"dist/cooler-btop-{version_expression}-1.fc44.src.rpm",
+        f"dist/cooler_btop-{version_expression}-py3-none-any.whl",
+        f"dist/cooler_btop-{version_expression}.tar.gz",
+        "dist/SHA256SUMS",
+    ]
+
+
+PINNED_ACTION_REFS = {
+    "actions/checkout": "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+    "actions/setup-python": "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+    "actions/upload-artifact": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "actions/download-artifact": "actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0",
+    "actions/attest": "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+}
+
+
 def has_native_magic(header):
     return any(header.startswith(magic) for magic in NATIVE_MAGICS)
 
@@ -83,6 +102,7 @@ def named_step(job, name):
 
 def assert_publish_artifact_flow(testcase, workflow):
     publish = workflow["jobs"]["publish"]
+    expected_paths = workflow_release_paths("${{ needs.build.outputs.version }}")
     downloads = [
         (index, step)
         for index, step in enumerate(publish["steps"])
@@ -90,6 +110,7 @@ def assert_publish_artifact_flow(testcase, workflow):
     ]
     testcase.assertEqual(len(downloads), 1)
     download_index, download = downloads[0]
+    testcase.assertEqual(download["uses"], PINNED_ACTION_REFS["actions/download-artifact"])
     testcase.assertEqual(download.get("with"), {
         "name": "release-files",
         "path": "dist",
@@ -117,9 +138,12 @@ def assert_publish_artifact_flow(testcase, workflow):
         "cd dist",
         "sha256sum --check SHA256SUMS",
     ])
+    release_command = publish["steps"][publication_index]["run"]
+    for path in expected_paths:
+        testcase.assertIn(path, release_command)
 
 
-def shell_command_invocations(script):
+def shell_command_invocations(script, _depth=0):
     invocations = []
     separators = {";", "&&", "||", "|", "&", "(", ")"}
     assignment = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -142,6 +166,17 @@ def shell_command_invocations(script):
             if segment:
                 invocations.append(segment)
             segment = []
+    if _depth < 4:
+        nested_scripts = []
+        for invocation in list(invocations):
+            executable = pathlib.PurePosixPath(invocation[0]).name.casefold()
+            if executable not in {"bash", "sh", "dash", "zsh", "ksh"}:
+                continue
+            for index, argument in enumerate(invocation[:-1]):
+                if argument.startswith("-") and "c" in argument[1:]:
+                    nested_scripts.append(invocation[index + 1])
+        for nested_script in nested_scripts:
+            invocations.extend(shell_command_invocations(nested_script, _depth + 1))
     return invocations
 
 
@@ -216,9 +251,14 @@ case "$1" in
             --scripts) query=scripts ;;
             --triggers) query=triggers ;;
             --qf)
-                query=filecaps
-                if [ "${EMPTY_FILECAPS:-0}" != 1 ]; then
-                    printf '/usr/bin/cooler-btop\t(none)\n'
+                if [ "${3:-}" = "%{VERSION}" ]; then
+                    query=version
+                    printf '2.0.0\n'
+                else
+                    query=filecaps
+                    if [ "${EMPTY_FILECAPS:-0}" != 1 ]; then
+                        printf '/usr/bin/cooler-btop\t(none)\n'
+                    fi
                 fi
                 ;;
             *) exit 64 ;;
@@ -281,7 +321,12 @@ case " $* " in
         ;;
     *"build_sdist"*)
         log sdist
-        printf 'fresh sdist\n' > "$DIST_DIR/cooler_btop-2.0.0.tar.gz"
+        sdist_root=$(mktemp -d)
+        mkdir -p "$sdist_root/cooler_btop-2.0.0"
+        printf 'fresh sdist\n' > "$sdist_root/cooler_btop-2.0.0/README.md"
+        tar -czf "$DIST_DIR/cooler_btop-2.0.0.tar.gz" \
+            -C "$sdist_root" cooler_btop-2.0.0
+        rm -rf "$sdist_root"
         ;;
     *" -m venv "*)
         log wheel-smoke
@@ -529,7 +574,7 @@ assert sys.argv[1:] == ["dnf", "install", "./cooler-btop-2.0.0-1.fc44.noarch.rpm
         ]
 
         self.assertEqual(metadata["build-system"]["requires"], ["setuptools>=61", "wheel"])
-        self.assertEqual(project["license"], {"text": "MIT"})
+        self.assertEqual(project["license"], "MIT")
         self.assertNotIn("license-files", project)
         self.assertEqual(project["dependencies"], requirements)
         self.assertIn("textual>=4.0,<9", requirements)
@@ -645,8 +690,14 @@ class DistributionTests(unittest.TestCase):
                 archive.read(metadata_name)
             )
 
-        self.assertEqual(metadata["License"], "MIT")
-        self.assertIn("textual<9,>=4.0", metadata.get_all("Requires-Dist"))
+        self.assertIn(
+            "MIT",
+            {metadata.get("License"), metadata.get("License-Expression")},
+        )
+        requirements = set(metadata.get_all("Requires-Dist"))
+        self.assertIn("textual<9,>=4.0", requirements)
+        self.assertIn("rich<15,>=13", requirements)
+        self.assertIn("requests<3,>=2.31", requirements)
 
     def test_sdist_matches_rpm_source_layout_and_contains_full_tests(self):
         spec = (ROOT / "packaging" / "cooler-btop.spec").read_text(encoding="utf-8")
@@ -818,10 +869,20 @@ class LinuxPackagingTests(unittest.TestCase):
     def test_makefile_defines_the_complete_release_pipeline(self):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 
-        for target in ("rpm-binary", "rpm-check", "checksums", "release"):
+        for target in (
+            "rpm-binary",
+            "rpm-check",
+            "checksums",
+            "coverage",
+            "reproducibility-check",
+            "release",
+        ):
             with self.subTest(target=target):
                 self.assertRegex(makefile, rf"(?m)^{target}:")
-        self.assertIn('tomllib.load(open("pyproject.toml", "rb"))', makefile)
+        self.assertIn("pyproject.toml", makefile)
+        self.assertIn("sed -n", makefile)
+        self.assertIn("SOURCE_DATE_EPOCH", makefile)
+        self.assertIn("--sort=name", makefile)
         self.assertIn("RPM_RELEASE := 1.fc44", makefile)
         self.assertIn("rpmbuild -bb packaging/cooler-btop.spec", makefile)
         self.assertIn('"_sourcedir $$dist_dir"', makefile)
@@ -843,7 +904,10 @@ class LinuxPackagingTests(unittest.TestCase):
             bin_path = temp_path / "bin"
             (bin_path / "rpmbuild").unlink()
             os.symlink(shutil.which("mkdir"), bin_path / "mkdir")
+            os.symlink(shutil.which("sed"), bin_path / "sed")
             os.symlink(shutil.which("touch"), bin_path / "touch")
+            for utility in ("mktemp", "tar", "gzip", "rm", "mv"):
+                os.symlink(shutil.which(utility), bin_path / utility)
             environment["PATH"] = str(bin_path)
             marker_path = temp_path / "injected"
             dist_path = temp_path / "output'; touch injected; printf 'x"
@@ -911,6 +975,7 @@ class LinuxPackagingTests(unittest.TestCase):
                 "scripts",
                 "triggers",
                 "filecaps",
+                "version",
             ):
                 with self.subTest(query=query):
                     environment = base_environment.copy()
@@ -1038,6 +1103,26 @@ class LinuxPackagingTests(unittest.TestCase):
 
         self.assertEqual(check.returncode, 0, check.stdout)
 
+    def test_checksums_preserves_existing_manifest_when_an_artifact_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = pathlib.Path(temp_dir) / "release output"
+            temp_path.mkdir()
+            for name in RELEASE_ARTIFACTS[:-1]:
+                (temp_path / name).write_bytes(b"artifact\n")
+            manifest_path = temp_path / "SHA256SUMS"
+            manifest_path.write_bytes(b"stale manifest\n")
+
+            result = subprocess.run(
+                ["make", "checksums", f"DIST_DIR={temp_path}"],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(manifest_path.read_bytes(), b"stale manifest\n")
+
     def test_parallel_release_uses_one_fresh_stage_and_publishes_exact_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = pathlib.Path(temp_dir)
@@ -1086,7 +1171,15 @@ class LinuxPackagingTests(unittest.TestCase):
                 sorted(RELEASE_ARTIFACTS + ["SHA256SUMS"]),
             )
             for name in RELEASE_ARTIFACTS:
-                self.assertTrue((dist_path / name).read_bytes().startswith(b"fresh "))
+                artifact_path = dist_path / name
+                if name.endswith(".tar.gz"):
+                    with tarfile.open(artifact_path, "r:gz") as archive:
+                        self.assertIn(
+                            "cooler_btop-2.0.0/README.md",
+                            archive.getnames(),
+                        )
+                else:
+                    self.assertTrue(artifact_path.read_bytes().startswith(b"fresh "))
             check = subprocess.run(
                 ["sha256sum", "--check", "SHA256SUMS"],
                 cwd=dist_path,
@@ -1138,7 +1231,10 @@ class LinuxPackagingTests(unittest.TestCase):
             r"(?m)^test:\s*\n\t\$\(PYTHON\) -m unittest discover -v$",
         )
         self.assertIn("make distributions", workflow)
-        self.assertIn("cooler_btop-2.0.0.tar.gz", workflow)
+        self.assertIn(
+            "dist/cooler_btop-${{ steps.project_version.outputs.version }}.tar.gz",
+            workflow,
+        )
 
     def test_packaging_tests_support_python_39_tomllib(self):
         source = (ROOT / "test_packaging.py").read_text(encoding="utf-8")
@@ -1149,7 +1245,20 @@ class LinuxPackagingTests(unittest.TestCase):
             "try:\n    import tomllib\nexcept ModuleNotFoundError:\n    import tomli as tomllib",
             source,
         )
-        self.assertIn("tomli", shlex.split(install["run"]))
+        self.assertIn(".[test]", shlex.split(install["run"]))
+
+    def test_project_declares_isolated_test_dependencies(self):
+        project = tomllib.loads(
+            (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]
+        self.assertEqual(
+            project["optional-dependencies"]["test"],
+            [
+                "PyYAML>=6.0,<7",
+                "coverage>=7,<8",
+                "tomli>=2.0; python_version < '3.11'",
+            ],
+        )
 
     def test_ci_has_supported_python_matrix_and_fedora_release_job(self):
         workflow = load_workflow("ci.yml")
@@ -1161,11 +1270,13 @@ class LinuxPackagingTests(unittest.TestCase):
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(set(workflow["jobs"]), {"python-package", "fedora-release"})
         python_job = workflow["jobs"]["python-package"]
+        self.assertEqual(python_job["timeout-minutes"], 15)
         self.assertEqual(
             python_job["strategy"]["matrix"]["python-version"],
             ["3.9", "3.14"],
         )
         fedora_job = workflow["jobs"]["fedora-release"]
+        self.assertEqual(fedora_job["timeout-minutes"], 30)
         self.assertEqual(fedora_job["container"], "fedora:44")
         dependencies = named_step(fedora_job, "Install Fedora build dependencies")["run"]
         for dependency in (
@@ -1218,12 +1329,23 @@ class LinuxPackagingTests(unittest.TestCase):
         build = workflow["jobs"]["build"]
         publish = workflow["jobs"]["publish"]
         self.assertEqual(build["container"], "fedora:44")
-        self.assertNotIn("permissions", build)
+        self.assertEqual(build["timeout-minutes"], 30)
+        self.assertEqual(build["permissions"], {
+            "contents": "read",
+            "id-token": "write",
+            "attestations": "write",
+            "artifact-metadata": "write",
+        })
         self.assertEqual(publish["needs"], "build")
+        self.assertEqual(publish["timeout-minutes"], 10)
         self.assertEqual(publish["permissions"], {"contents": "write"})
         tag_check = named_step(build, "Require tag to match project version")["run"]
         self.assertIn('expected_tag="v$(python3 -c', tag_check)
         self.assertIn('test "$GITHUB_REF_NAME" = "$expected_tag"', tag_check)
+        self.assertEqual(
+            build["outputs"]["version"],
+            "${{ steps.project_version.outputs.version }}",
+        )
         self.assertEqual(
             named_step(build, "Build and validate release artifacts")["run"],
             "make release",
@@ -1251,25 +1373,40 @@ class LinuxPackagingTests(unittest.TestCase):
         release = load_workflow("release.yml")
         release_upload = named_step(release["jobs"]["build"], "Upload release artifacts")
 
-        for upload in (ci_upload, release_upload):
+        for upload, version_expression in (
+            (ci_upload, "${{ steps.project_version.outputs.version }}"),
+            (release_upload, "${{ steps.project_version.outputs.version }}"),
+        ):
             with self.subTest(artifact=upload["with"]["name"]):
                 paths = upload["with"]["path"].splitlines()
-                self.assertEqual(paths, RELEASE_PATHS)
+                self.assertEqual(paths, workflow_release_paths(version_expression))
                 self.assertFalse(any("*" in path for path in paths), paths)
 
         release_command = named_step(
             release["jobs"]["publish"], "Create GitHub release"
         )["run"]
-        self.assertEqual(shlex.split(release_command), [
-            "gh",
-            "release",
-            "create",
-            "$GITHUB_REF_NAME",
-            *RELEASE_PATHS,
-            "--verify-tag",
-            "--generate-notes",
-        ])
+        self.assertEqual(
+            shlex.split(release_command)[:4],
+            ["gh", "release", "create", "$GITHUB_REF_NAME"],
+        )
+        for path in workflow_release_paths("${{ needs.build.outputs.version }}"):
+            self.assertIn(path, release_command)
+        self.assertIn("--verify-tag --generate-notes", release_command)
         self.assertNotIn("*", release_command)
+
+    def test_workflows_pin_every_github_action_to_a_known_commit(self):
+        for workflow_name in ("ci.yml", "release.yml"):
+            workflow = load_workflow(workflow_name)
+            for job_name, job in workflow["jobs"].items():
+                for step in job["steps"]:
+                    uses = step.get("uses")
+                    if not uses:
+                        continue
+                    action, separator, commit = uses.partition("@")
+                    with self.subTest(workflow=workflow_name, job=job_name, uses=uses):
+                        self.assertTrue(separator)
+                        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+                        self.assertEqual(uses, PINNED_ACTION_REFS[action])
 
     def test_fedora_jobs_distinguish_not_installed_from_rpm_query_errors(self):
         jobs = (
@@ -1288,12 +1425,13 @@ class LinuxPackagingTests(unittest.TestCase):
         self.assertEqual(set(workflow.get("on", {})), {"push"})
         self.assertNotIn("pull_request", workflow.get("on", {}))
         self.assertNotIn("release", workflow.get("on", {}))
-        for permissions in (
-            workflow["permissions"],
-            workflow["jobs"]["publish"]["permissions"],
-        ):
-            self.assertNotIn("packages", permissions)
-            self.assertNotIn("id-token", permissions)
+        self.assertNotIn("packages", workflow["permissions"])
+        self.assertNotIn("id-token", workflow["permissions"])
+        self.assertNotIn("packages", workflow["jobs"]["publish"]["permissions"])
+        self.assertNotIn("id-token", workflow["jobs"]["publish"]["permissions"])
+        attest = named_step(workflow["jobs"]["build"], "Attest release artifacts")
+        self.assertEqual(attest["uses"], PINNED_ACTION_REFS["actions/attest"])
+        self.assertEqual(attest["with"], {"subject-checksums": "dist/SHA256SUMS"})
         self.assertNotIn(
             "secrets.",
             (ROOT / ".github" / "workflows" / "release.yml").read_text(
@@ -1365,7 +1503,7 @@ class LinuxPackagingTests(unittest.TestCase):
         named_step(
             other_action_version["jobs"]["publish"], "Download release artifacts"
         )["uses"] = "actions/download-artifact@future-version"
-        assert_publish_artifact_flow(self, other_action_version)
+        invalid_workflows.append(("un-pinned download action", other_action_version))
 
         for reason, invalid_workflow in invalid_workflows:
             with self.subTest(reason=reason):
@@ -1448,24 +1586,55 @@ class LinuxPackagingTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, operation):
                     assert_no_prohibited_run_commands(self, invalid)
 
+        indirect = copy.deepcopy(workflows)
+        indirect["release.yml"]["jobs"]["publish"]["steps"].insert(0, {
+            "name": "Indirect prohibited operation",
+            "run": "bash -c 'git push origin v2.0.0'",
+        })
+        with self.assertRaisesRegex(AssertionError, "git tag or push"):
+            assert_no_prohibited_run_commands(self, indirect)
+
     def test_container_is_unprivileged_read_only_and_binds_its_api(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
         self.assertIn("USER cooler-btop", dockerfile)
-        self.assertIn('"--host", "0.0.0.0"', dockerfile)
+        self.assertIn("--host 0.0.0.0", dockerfile)
+        self.assertIn("COOLER_BTOP_AUTH_TOKEN must be set", dockerfile)
         self.assertNotIn("privileged:", compose)
         self.assertNotRegex(compose, r"(?m)^\s*pid:\s*[\"']?host")
         self.assertIn("read_only: true", compose)
         self.assertIn("cap_drop:", compose)
         self.assertRegex(compose, r"(?m)^\s*- ALL$")
         self.assertIn("no-new-privileges:true", compose)
+        self.assertIn("COOLER_BTOP_AUTH_TOKEN:", compose)
+        self.assertIn("Authorization", compose)
 
     def test_docker_context_excludes_local_and_generated_files(self):
         dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
-        for excluded in ("__pycache__/", "*.pyc", "dist/", "build/", "*.egg-info/",
-                         "continuous_runner.log", ".git/"):
+        for excluded in (
+            "__pycache__/",
+            "*.pyc",
+            "dist/",
+            "build/",
+            "*.egg-info/",
+            "continuous_runner.log",
+            "continuous_runner.sh",
+            "AGENT_RULES.md",
+            ".opencode/",
+            ".superpowers/",
+            "*.sqlite",
+            "*.db",
+            ".env",
+            ".git/",
+        ):
             self.assertIn(excluded, dockerignore)
+
+    def test_makefile_uses_the_documented_docker_compose_command(self):
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("docker compose build", makefile)
+        self.assertIn("docker compose up -d", makefile)
+        self.assertNotIn("docker-compose", makefile)
 
     def test_obsolete_root_service_is_absent(self):
         self.assertFalse((ROOT / "cooler-btop.service").exists())

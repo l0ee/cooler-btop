@@ -1,0 +1,3 @@
+# Require maintainer review for every repository change, including this file.
+* @l0ee
+/.github/CODEOWNERS @l0ee

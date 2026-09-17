@@ -1,5 +1,6 @@
 from collections import deque
 import datetime
+import math
 
 import psutil
 from rich.text import Text
@@ -21,6 +22,12 @@ CYAN = "#82c9d7"
 
 
 def format_bytes(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not math.isfinite(value):
+        return "N/A"
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if abs(value) < 1024:
             return f"{value:.1f}{unit}"
@@ -30,14 +37,60 @@ def format_bytes(value):
 
 def make_bar(percent, width=15):
     blocks = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
-    width = max(0, width)
+    try:
+        width = max(0, int(width))
+    except (TypeError, ValueError):
+        width = 0
+    try:
+        percent = float(percent)
+    except (TypeError, ValueError):
+        percent = 0.0
+    if not math.isfinite(percent):
+        percent = 0.0
     filled = max(0, min(100, percent)) / 100 * width
     full = int(filled)
-    return "█" * full + (blocks[int((filled - full) * 8)] + " " * (width - full - 1) if full < width else "")
+    return "█" * full + (
+        blocks[min(7, max(0, int((filled - full) * 8)))] + " " * (width - full - 1)
+        if full < width else ""
+    )
 
 
 def display_value(value, suffix=""):
-    return "N/A" if value is None else f"{value:g}{suffix}" if isinstance(value, (int, float)) else f"{value}{suffix}"
+    if value is None:
+        return "N/A"
+    if isinstance(value, (int, float)):
+        return "N/A" if not math.isfinite(value) else f"{value:g}{suffix}"
+    return f"{value}{suffix}"
+
+
+def _number(value, default=0.0):
+    """Return a finite float for defensive widget rendering."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
+def _optional_number(value):
+    """Return a finite float or None when a metric is unavailable."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _limit_command(value, limit=4096):
+    """Turn a process command into bounded, single-display text."""
+    if isinstance(value, (list, tuple)):
+        value = ' '.join(str(part) for part in value)
+    value = str(value or '')
+    if len(value) <= limit:
+        return value
+    return value[:max(0, limit - 1)] + '\u2026'
 
 
 class MetricWidget(VerticalScroll):
@@ -67,11 +120,13 @@ class SysInfoWidget(MetricWidget):
 
     def metric_text(self):
         data = self.sys_data
-        if data is None:
+        if not isinstance(data, dict):
             return Text("Waiting for system telemetry", style=MUTED)
         specs = data.get('specs') or {}
-        cpu_temp = data.get('cpu_temp')
-        if not isinstance(cpu_temp, (int, float)) or cpu_temp <= 0:
+        if not isinstance(specs, dict):
+            specs = {}
+        cpu_temp = _optional_number(data.get('cpu_temp'))
+        if cpu_temp is None or cpu_temp <= 0:
             cpu_temp = None
         hardware = ' '.join(
             str(value) for value in (specs.get('vendor'), specs.get('product_model')) if value
@@ -103,19 +158,23 @@ class SysInfoWidget(MetricWidget):
             text.append(f"{label:<9}", style=MUTED)
             text.append(str(value), style=AMBER if label == "CPU temp" else TEXT)
         for sensor in data.get('sensors') or []:
+            if not isinstance(sensor, dict):
+                continue
             if sensor.get('category') == 'CPU' and sensor.get('type') == 'temperature':
                 continue
             text.append("\n")
             text.append(f"{str(sensor.get('label') or 'Sensor'):<9}", style=MUTED)
             value = sensor.get('value')
-            if sensor.get('unit') == 'RPM' and isinstance(value, (int, float)):
-                rendered = f"{value:g} RPM"
+            if sensor.get('unit') == 'RPM' and _optional_number(value) is not None:
+                rendered = f"{_optional_number(value):g} RPM"
             else:
                 rendered = display_value(value, f" {sensor.get('unit') or ''}".rstrip())
             text.append(rendered, style=AMBER)
         battery_info = data.get('battery_info') or []
         if battery_info:
             battery = battery_info[0]
+            if not isinstance(battery, dict):
+                battery = {}
             text.append("\n")
             text.append("Battery W", style=MUTED)
             text.append(display_value(battery.get('power_w'), " W"))
@@ -136,25 +195,30 @@ class CPUWidget(MetricWidget):
 
     def watch_cpu_data(self, data):
         if data is not None:
-            self.history.append(data['total'])
+            self.history.append(_number(data.get('total')) if isinstance(data, dict) else 0)
         self.refresh_content()
 
     def metric_text(self):
         data = self.cpu_data
-        if data is None:
+        if not isinstance(data, dict):
             return Text("Waiting for CPU telemetry", style=MUTED)
-        cores = data.get('per_core', [])
-        core_ids = data.get('core_ids', [])
+        cores = data.get('per_core') or []
+        core_ids = data.get('core_ids') or []
         width = self.graph_width
-        text = Text(f"{data['total']:5.1f}%", style=f"bold {AMBER}")
-        text.append(f"  {data.get('freq', 0) / 1000:.2f} GHz  /  {len(cores)} cores\n", style=MUTED)
+        text = Text(f"{_number(data.get('total')):5.1f}%", style=f"bold {AMBER}")
+        text.append(f"  {_number(data.get('freq')) / 1000:.2f} GHz  /  {len(cores)} cores\n", style=MUTED)
         text.append(make_braille_graph(list(self.history), width, 2), style=AMBER)
         text.append("\nCORE LOAD", style=MUTED)
         columns = max(1, (width + 1) // 10)
         for index, load in enumerate(cores):
             core_id = core_ids[index] if index < len(core_ids) else index
             text.append("\n" if index % columns == 0 else " ")
-            text.append(f"{core_id:02} ", style=MUTED)
+            try:
+                core_label = f"{int(core_id):02}"
+            except (TypeError, ValueError):
+                core_label = str(core_id)
+            load = _number(load)
+            text.append(f"{core_label} ", style=MUTED)
             text.append(f"{load:5.1f}%", style=AMBER if load >= 50 else TEXT)
         return text
 
@@ -166,19 +230,32 @@ class MemWidget(MetricWidget):
         self.refresh_content()
 
     def metric_text(self):
-        if self.mem_data is None:
+        if not isinstance(self.mem_data, dict):
             return Text("Waiting for memory telemetry", style=MUTED)
-        mem, swap = self.mem_data['mem'], self.mem_data['swap']
+        mem, swap = self.mem_data.get('mem'), self.mem_data.get('swap')
+        if mem is None or swap is None:
+            return Text("Memory telemetry unavailable; retrying", style=MUTED)
         width = max(1, self.graph_width - 2)
-        text = Text(f"RAM  {mem.percent:4.1f}%", style=f"bold {CYAN}")
-        text.append(f"  {format_bytes(mem.used)} / {format_bytes(mem.total)}\n", style=TEXT)
-        text.append(f"[{make_bar(mem.percent, width)}]\n", style=CYAN)
-        text.append(f"Available {format_bytes(mem.available)}", style=MUTED)
+        mem_percent = _number(getattr(mem, 'percent', 0))
+        text = Text(f"RAM  {mem_percent:4.1f}%", style=f"bold {CYAN}")
+        text.append(
+            f"  {format_bytes(getattr(mem, 'used', None))} / "
+            f"{format_bytes(getattr(mem, 'total', None))}\n", style=TEXT,
+        )
+        text.append(f"[{make_bar(mem_percent, width)}]\n", style=CYAN)
+        text.append(f"Available {format_bytes(getattr(mem, 'available', None))}", style=MUTED)
         if hasattr(mem, 'buffers') and hasattr(mem, 'cached'):
-            text.append(f"\nBuffers {format_bytes(mem.buffers)}  Cache {format_bytes(mem.cached)}", style=MUTED)
-        text.append(f"\nSWAP {swap.percent:4.1f}%", style=f"bold {CYAN}")
-        text.append(f"  {format_bytes(swap.used)} / {format_bytes(swap.total)}\n", style=TEXT)
-        text.append(f"[{make_bar(swap.percent, width)}]", style=CYAN)
+            text.append(
+                f"\nBuffers {format_bytes(getattr(mem, 'buffers', None))}  "
+                f"Cache {format_bytes(getattr(mem, 'cached', None))}", style=MUTED,
+            )
+        swap_percent = _number(getattr(swap, 'percent', 0))
+        text.append(f"\nSWAP {swap_percent:4.1f}%", style=f"bold {CYAN}")
+        text.append(
+            f"  {format_bytes(getattr(swap, 'used', None))} / "
+            f"{format_bytes(getattr(swap, 'total', None))}\n", style=TEXT,
+        )
+        text.append(f"[{make_bar(swap_percent, width)}]", style=CYAN)
         return text
 
 
@@ -191,23 +268,29 @@ class GPUWidget(MetricWidget):
     def metric_text(self):
         if self.gpu_data is None:
             return Text("Waiting for GPU telemetry", style=MUTED)
-        if not self.gpu_data or all(gpu['name'] == 'No GPU' for gpu in self.gpu_data):
+        if not isinstance(self.gpu_data, (list, tuple)):
+            return Text("GPU telemetry unavailable; retrying", style=MUTED)
+        if not self.gpu_data or all(
+            not isinstance(gpu, dict) or gpu.get('name') == 'No GPU' for gpu in self.gpu_data
+        ):
             return Text("No GPU telemetry available\nCPU and memory monitoring remain active.", style=MUTED)
         text = Text(style=TEXT)
         for gpu in self.gpu_data:
+            if not isinstance(gpu, dict):
+                continue
             if text:
                 text.append("\n\n")
             text.append(gpu.get('name') or 'N/A', style=f"bold {MINT}")
-            load = gpu.get('load')
-            if isinstance(load, (int, float)):
+            load = _optional_number(gpu.get('load'))
+            if load is not None:
                 text.append(f"\nLoad {load:5.1f}% ", style=MINT)
                 text.append(make_bar(load, max(1, self.graph_width - 13)), style=MINT)
             else:
                 text.append("\nLoad N/A", style=MUTED)
-            mem_total = gpu.get('mem_total')
+            mem_total = _optional_number(gpu.get('mem_total'))
             mem_used = gpu.get('mem_used')
             mem_pct = gpu.get('mem_pct')
-            if isinstance(mem_total, (int, float)) and mem_total > 0:
+            if mem_total is not None and mem_total > 0:
                 text.append(
                     f"\nVRAM {display_value(mem_pct, '%')}  "
                     f"{display_value(mem_used)} / {display_value(mem_total)} MB", style=CYAN,
@@ -236,15 +319,15 @@ class NetWidget(MetricWidget):
         self.max_speed = 1024
 
     def watch_net_data(self, data):
-        if data is not None:
-            self.down_hist.append(data['down'])
-            self.up_hist.append(data['up'])
-            self.max_speed = max(*self.down_hist, *self.up_hist, 1024)
+        if isinstance(data, dict):
+            self.down_hist.append(_number(data.get('down')))
+            self.up_hist.append(_number(data.get('up')))
+            self.max_speed = max((*self.down_hist, *self.up_hist, 1024))
         self.refresh_content()
 
     def metric_text(self):
         data = self.net_data
-        if data is None:
+        if not isinstance(data, dict):
             return Text("Waiting for network telemetry", style=MUTED)
         text = Text(style=TEXT)
         for label, key, history, color in [
@@ -253,12 +336,14 @@ class NetWidget(MetricWidget):
         ]:
             if text:
                 text.append("\n")
-            text.append(f"{label:<4} {format_bytes(data[key])}/s", style=f"bold {color}")
-            text.append(f"  /  {format_bytes(data['total_' + key])} total\n", style=MUTED)
+            text.append(f"{label:<4} {format_bytes(data.get(key))}/s", style=f"bold {color}")
+            text.append(f"  /  {format_bytes(data.get('total_' + key))} total\n", style=MUTED)
             points = [value / self.max_speed * 100 for value in history]
             text.append(make_braille_graph(points, self.graph_width, 2), style=color)
         text.append(f"\nShared scale {format_bytes(self.max_speed)}/s", style=MUTED)
         for interface in data.get('interfaces') or []:
+            if not isinstance(interface, dict):
+                continue
             state = 'UP' if interface.get('is_up') is True else 'DOWN' if interface.get('is_up') is False else 'N/A'
             speed = display_value(interface.get('speed_mbps'), ' Mbps')
             mtu = display_value(interface.get('mtu'))
@@ -284,7 +369,12 @@ class ConnsWidget(Vertical):
         self.dt.clear()
         seen = set()
         for connection in data:
-            key = (connection['proto'], connection['port'])
+            if not isinstance(connection, dict):
+                continue
+            proto, port = connection.get('proto'), connection.get('port')
+            if proto is None or port is None:
+                continue
+            key = (proto, port)
             if key not in seen:
                 self.dt.add_row(Text(str(key[0])), str(key[1]), Text(str(connection.get('state', 'LISTEN'))))
                 seen.add(key)
@@ -304,22 +394,28 @@ class DiskWidget(Vertical):
         yield self.dt
 
     def on_resize(self):
-        if self.disk_data is not None:
+        if self.disk_data is not None and hasattr(self, 'dt'):
             self.watch_disk_data(self.disk_data)
 
     def watch_disk_data(self, data):
-        if data is None:
+        if not isinstance(data, dict):
             return
-        io = data.get('io', {})
+        io = data.get('io') or {}
+        if not isinstance(io, dict):
+            io = {}
         text = Text(f"READ {format_bytes(io.get('read_bytes', 0))}/s", style=CYAN)
         text.append(f"  WRITE {format_bytes(io.get('write_bytes', 0))}/s", style=MINT)
         if not data.get('partitions'):
             text.append("\nNo mounted partitions", style=MUTED)
         for device in data.get('devices') or []:
+            if not isinstance(device, dict):
+                continue
             text.append(f"\n{device.get('name') or 'N/A'}  ", style=MUTED)
             text.append(device.get('model') or device.get('type') or 'N/A')
             text.append(f"  {format_bytes(device['capacity']) if device.get('capacity') is not None else 'N/A'}", style=MUTED)
         for zram in data.get('zram') or []:
+            if not isinstance(zram, dict):
+                continue
             text.append(f"\n{zram.get('name') or 'zram'}  ", style=MINT)
             text.append(
                 f"{format_bytes(zram['memory_bytes']) if zram.get('memory_bytes') is not None else 'N/A'} RAM / "
@@ -329,14 +425,23 @@ class DiskWidget(Vertical):
         self.io_static.update(text)
         row = self.dt.cursor_row
         self.dt.clear()
-        for disk in {partition['mount']: partition for partition in data.get('partitions', [])}.values():
-            mount = Text(disk['mount'], no_wrap=True)
-            mount.truncate(max(5, min(14, self.content_size.width - 34)), overflow="ellipsis")
+        partitions = {}
+        for partition in data.get('partitions') or []:
+            if isinstance(partition, dict) and partition.get('mount'):
+                partitions[str(partition['mount'])] = partition
+        for disk in partitions.values():
+            total = _number(disk.get('total'))
+            used = _number(disk.get('used'))
+            free = disk.get('free')
+            if free is None:
+                free = max(0, total - used)
+            mount = Text(str(disk['mount']), no_wrap=True)
+            content_width = getattr(self.content_size, 'width', 0)
+            mount.truncate(max(5, min(14, content_width - 34)), overflow="ellipsis")
             self.dt.add_row(
-                mount, disk.get('filesystem') or 'N/A', format_bytes(disk['total']).replace('.0', ''),
-                format_bytes(disk['used']).replace('.0', ''),
-                format_bytes(disk.get('free', disk['total'] - disk['used'])).replace('.0', ''),
-                f"{disk['percent']:.1f}%", key=disk['mount'],
+                mount, disk.get('filesystem') or 'N/A', format_bytes(total).replace('.0', ''),
+                format_bytes(used).replace('.0', ''), format_bytes(free).replace('.0', ''),
+                f"{_number(disk.get('percent')):.1f}%", key=str(disk['mount']),
             )
         self.dt.move_cursor(row=min(row, max(0, self.dt.row_count - 1)), scroll=False)
 
@@ -363,15 +468,32 @@ class ProcWidget(Vertical):
     def selected_pid(self):
         if not self.dt.row_count:
             return None
-        return int(self.dt.ordered_rows[self.dt.cursor_row].key.value)
+        try:
+            return int(self.dt.ordered_rows[self.dt.cursor_row].key.value)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return None
 
     def on_resize(self):
-        if self.proc_data is not None:
+        if self.proc_data is not None and hasattr(self, 'dt'):
             self.watch_proc_data(self.proc_data)
 
     def watch_proc_data(self, data):
-        if data is None:
+        if not isinstance(data, (list, tuple)):
             return
+        valid = []
+        for process in data:
+            if not isinstance(process, dict):
+                continue
+            try:
+                pid = int(process.get('pid'))
+            except (TypeError, ValueError):
+                continue
+            if pid <= 0:
+                continue
+            item = dict(process)
+            item['pid'] = pid
+            valid.append(item)
+        data = valid
         selected = self.selected_pid
         cursor_row = self.dt.cursor_row
         order = {str(process['pid']): index for index, process in enumerate(data)}
@@ -379,23 +501,22 @@ class ProcWidget(Vertical):
             self.dt.remove_row(key)
             del self._cell_cache[key]
 
-        command_width = max(12, self.content_size.width - 42)
+        command_width = max(1, getattr(self.content_size, 'width', 0) - 42)
         for process in data:
             pid = str(process['pid'])
             name = str(process.get('name') or '')
-            command = process.get('cmdline') or ''
-            if isinstance(command, (list, tuple)):
-                command = ' '.join(command)
-            command = str(command)
-            if command and command != name.removeprefix(process.get('tree_prefix', '')):
+            command = _limit_command(process.get('cmdline'))
+            tree_prefix = str(process.get('tree_prefix') or '')
+            if command and command != name.removeprefix(tree_prefix):
                 name += f" | {command}"
             display_name = Text(' '.join(name.splitlines()), style=TEXT, no_wrap=True)
             display_name.truncate(command_width, overflow="ellipsis")
             user = Text(str(process.get('username') or ''), no_wrap=True, overflow="ellipsis")
             user.truncate(10, overflow="ellipsis")
             cells = (
-                pid, user, Text(f"{process.get('cpu_percent') or 0:6.1f}", style=AMBER),
-                Text(f"{process.get('memory_percent') or 0:5.1f}", style=CYAN), display_name,
+                pid, user,
+                Text(f"{_number(process.get('cpu_percent')):6.1f}", style=AMBER),
+                Text(f"{_number(process.get('memory_percent')):5.1f}", style=CYAN), display_name,
             )
             cached = self._cell_cache.get(pid)
             if cached is None:
@@ -407,7 +528,11 @@ class ProcWidget(Vertical):
             self._cell_cache[pid] = cells
 
         # DataTable insertion order is not display order. Keep identity, not row number.
-        self.dt.sort("PID", key=lambda pid: order[pid])
+        def row_order(row_key):
+            value = getattr(row_key, 'value', row_key)
+            return order.get(str(value), len(order))
+
+        self.dt.sort("PID", key=row_order)
         if data:
             row = order.get(str(selected), min(cursor_row, len(data) - 1))
             self.dt.move_cursor(row=row, scroll=self.dt.has_focus)
@@ -432,7 +557,7 @@ class AnimePetWidget(Static):
     def animate_pet(self):
         if self.paused:
             return
-        self.tick += 2 if self.cpu_speed >= 50 else 1
+        self.tick += 2 if _number(self.cpu_speed) >= 50 else 1
         face = "(=^.^=)" if self.tick % 8 < 6 else "(=-.-=)"
         self.update(Text(face, style=MINT, justify="right"))
 
@@ -511,7 +636,7 @@ class ProcDetailsModal(DismissibleModal):
             with process.oneshot():
                 for label, read in [
                     ("Name", process.name),
-                    ("Command", lambda: ' '.join(process.cmdline())),
+                    ("Command", lambda: _limit_command(process.cmdline())),
                     ("Executable", process.exe),
                     ("User", process.username),
                     ("Parent PID", process.ppid),
@@ -530,7 +655,10 @@ class ProcDetailsModal(DismissibleModal):
                     text.append(f"{value}\n")
         except (psutil.Error, OSError, ValueError) as error:
             text.append(f"Process unavailable: {error}", style=AMBER)
-        self.app.call_from_thread(self._show_details, text)
+        try:
+            self.app.call_from_thread(self._show_details, text)
+        except RuntimeError:
+            pass  # The app may have closed while the worker was reading.
 
     def _show_details(self, text):
         if self.is_mounted:

@@ -1,4 +1,4 @@
 textual>=4.0,<9
-rich
+rich>=13,<15
 psutil>=5.9.0
-requests
+requests>=2.31,<3

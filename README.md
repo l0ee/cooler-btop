@@ -17,6 +17,10 @@ awk '$2 == "cooler-btop-2.0.0-1.fc44.noarch.rpm" { print }' SHA256SUMS | sha256s
 sudo dnf install ./cooler-btop-2.0.0-1.fc44.noarch.rpm
 ```
 
+Tagged releases also publish a GitHub artifact attestation covering every file
+listed in `SHA256SUMS`; maintainer verification instructions are in
+`CONTRIBUTING.md`.
+
 Launch **Cooler btop** from the desktop application grid or run
 `cooler-btop` in a terminal. Press `q` to exit. The RPM installs
 `/usr/bin/cooler-btop`; it does not replace or conflict with `btop`, install a
@@ -74,13 +78,27 @@ tooling is already installed, `make rpm-source` creates a source RPM from
 
 ## Container Daemon
 
-`docker compose up --build` starts the read-only dashboard on
-`http://127.0.0.1:8080`. The daemon binds `0.0.0.0` inside the container so the
-published port works, but Compose exposes it only on the host loopback
-interface. The container runs without host PID mode, host `/proc` or `/sys`
-mounts, blanket privileges, or Linux capabilities. Its metrics describe the
-container's process and resource namespace, not the host.
+The container bind is non-loopback, so Compose requires an authentication token
+before it will start:
+
+```bash
+export COOLER_BTOP_AUTH_TOKEN="use-a-long-random-value"
+docker compose up --build
+```
+
+This starts the read-only dashboard on
+`http://127.0.0.1:8080/?token=$COOLER_BTOP_AUTH_TOKEN`. The token in the URL is
+exchanged for an HttpOnly same-origin cookie so the browser's native SSE client
+can authenticate. Treat that URL as a secret; for scripted API access, prefer
+an `Authorization: Bearer ...` header. The daemon binds `0.0.0.0` inside the
+container so the published port works, but Compose exposes it only on the host
+loopback interface. The container runs without host PID mode, host `/proc` or
+`/sys` mounts, blanket privileges, or Linux capabilities. Its metrics describe
+the container's process and resource namespace, not the host.
 
 Outside the container, daemon mode binds to `127.0.0.1` by default. If you bind
-it to another interface, apply network access controls because metrics may
-include host and process information.
+it to another interface, provide `--auth-token` (or
+`COOLER_BTOP_AUTH_TOKEN`) and apply network access controls because metrics may
+include host and process information. Use `--privacy-mode` to replace process
+command arguments with process names, and `--log-retention N` to cap SQLite
+history at N rows.

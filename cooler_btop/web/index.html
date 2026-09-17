@@ -326,7 +326,18 @@
         window.addEventListener('resize', () => Object.values(graphs).forEach(graph => graph.resize()));
 
         const connection = document.getElementById('connection');
-        const eventSource = new EventSource("/api/metrics/stream");
+        // Exchange a dashboard URL token for the server's HttpOnly cookie, then
+        // remove it from the visible URL before opening the native SSE stream.
+        const dashboardToken = new URLSearchParams(window.location.search).get('token');
+        if (dashboardToken && window.history && window.history.replaceState) {
+            window.history.replaceState(
+                null,
+                document.title,
+                `${window.location.pathname}${window.location.hash}`,
+            );
+        }
+        const streamPath = '/api/metrics/stream';
+        const eventSource = new EventSource(streamPath, {withCredentials: true});
         eventSource.onopen = () => {
             connection.textContent = 'LIVE / SSE';
             connection.classList.add('live');
@@ -335,6 +346,10 @@
             connection.textContent = 'RECONNECTING';
             connection.classList.remove('live');
         };
+        eventSource.addEventListener('stale', () => {
+            connection.textContent = 'STALE / RECONNECTING';
+            connection.classList.remove('live');
+        });
         eventSource.onmessage = event => {
             try {
                 const data = JSON.parse(event.data);

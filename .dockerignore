@@ -4,6 +4,7 @@ dist/
 build/
 *.egg-info/
 continuous_runner.log
+continuous_runner.sh
 .git/
 .github/
 docs/
@@ -11,3 +12,12 @@ packaging/
 RESEARCH_*.md
 OPTIMIZATION_LOG.md
 TASKS.md
+AGENT_RULES.md
+.opencode/
+.superpowers/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+.env
+.env.*

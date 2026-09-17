@@ -9,6 +9,11 @@ venv/
 env.bak/
 venv.bak/
 metrics.sqlite
+*.sqlite
+*.sqlite3
+*.db
+.env
+.env.*
 crash.log
 crash2.log
 crash3.log
@@ -22,6 +27,7 @@ continuous_runner.sh
 OPTIMIZATION_LOG.md
 RESEARCH_*.md
 *.egg-info/
+.coverage
 *.so
 *.o
 build/

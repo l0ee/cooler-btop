@@ -6,8 +6,10 @@ import re
 import socket
 import subprocess
 import time
-from .fast_telemetry import FastTelemetry
 from collections import namedtuple
+
+from . import fast_telemetry
+from .fast_telemetry import FastTelemetry
 
 SYS_PATH = os.environ.get('HOST_SYS', '/sys')
 TOPOLOGY_CACHE_SECONDS = 5.0
@@ -28,6 +30,17 @@ IP_CANDIDATE_PATTERN = re.compile(
 IPV4_CANDIDATE_PATTERN = re.compile(
     r'(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])'
 )
+SCOPED_IPV6_CANDIDATE_PATTERN = re.compile(
+    r'(?i)(?<![0-9a-z])\[?(?=[0-9a-f:.]*:)'
+    r'[0-9a-f:.]+%[0-9a-z_.-]+\]?(?![0-9a-z])'
+)
+MAC_INTERFACE_PATTERN = re.compile(
+    r'(?i)(?<![0-9a-z])(?:enx|wlx|wwx)[0-9a-f]{12}(?![0-9a-z])'
+)
+DISK_SECTOR_BYTES = 512
+MAX_CONNECTIONS = 10
+MAX_FALLBACK_PROCESS_COUNT = 4096
+MAX_PROCESS_CMDLINE_CHARS = 4096
 
 
 def _read_interface_link_addresses():
@@ -62,24 +75,31 @@ def _normalize_link_identity(address):
 def _address_snapshot(interface_addresses):
     try:
         if callable(interface_addresses):
-            return interface_addresses()
-        return interface_addresses or {}
-    except (OSError, ValueError):
+            snapshot = interface_addresses()
+        else:
+            snapshot = interface_addresses or {}
+        return snapshot if hasattr(snapshot, 'get') else {}
+    except (OSError, ValueError, TypeError, psutil.Error):
         return {}
 
 
 def _link_identity(addresses, name):
-    link_identity = addresses.get(name)
+    link_identity = addresses.get(name) if hasattr(addresses, 'get') else None
     if not isinstance(link_identity, str):
-        link_identity = next((
-            address.address for address in link_identity or ()
-            if getattr(address, 'family', None) == psutil.AF_LINK
-            and isinstance(getattr(address, 'address', None), str)
-        ), None)
+        try:
+            link_identity = next((
+                address.address for address in link_identity or ()
+                if getattr(address, 'family', None) == psutil.AF_LINK
+                and isinstance(getattr(address, 'address', None), str)
+            ), None)
+        except (TypeError, AttributeError, psutil.Error):
+            link_identity = None
     return _normalize_link_identity(link_identity)
 
 
 def _public_interface_name(name):
+    if not isinstance(name, str):
+        return str(name)
     match = re.fullmatch(r'(enx|wlx|wwx)[0-9a-fA-F]{12}', name)
     if not match:
         return name
@@ -102,9 +122,20 @@ def _redact_private_tokens(value):
             components.append('[redacted]')
             continue
         component = UUID_PATTERN.sub('[redacted]', component)
+        # A zone identifier may itself be a colon-separated hardware address.
+        # Remove that token before the scoped-IPv6 matcher can split it at the
+        # first colon.
         component = MAC_PATTERN.sub('[redacted]', component)
+        # Redact the whole scoped address before processing the scope name.
+        # Otherwise a regex that stops at the interface's first non-hex
+        # character can leave a MAC-derived name such as enx<mac> visible.
+        component = SCOPED_IPV6_CANDIDATE_PATTERN.sub(
+            lambda _match: '[redacted]', component,
+        )
         component = IPV4_CANDIDATE_PATTERN.sub(redact_ip, component)
-        components.append(IP_CANDIDATE_PATTERN.sub(redact_ip, component))
+        component = IP_CANDIDATE_PATTERN.sub(redact_ip, component)
+        component = MAC_INTERFACE_PATTERN.sub('[redacted]', component)
+        components.append(component)
     return '/'.join(components)
 
 
@@ -121,11 +152,16 @@ def key_interface_counters(counters, interface_index, interface_addresses):
     """Key psutil counters by the kernel identity of each interface."""
     addresses = _address_snapshot(interface_addresses)
     keyed = {}
-    for name, values in counters.items():
+    try:
+        items = list(counters.items())
+    except (AttributeError, TypeError):
+        return keyed
+    for item in items:
         try:
+            name, values = item
             link_identity = _link_identity(addresses, name)
             identity = (name, interface_index(name), link_identity)
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError, AttributeError, psutil.Error):
             continue
         keyed[identity] = values
     return keyed
@@ -139,7 +175,10 @@ def _sample_interface_counters(interface_index, interface_addresses):
             indices_before[name] = interface_index(name)
         except (OSError, ValueError):
             continue
-    counters = psutil.net_io_counters(pernic=True)
+    try:
+        counters = psutil.net_io_counters(pernic=True)
+    except (OSError, AttributeError, TypeError, psutil.Error):
+        return {}
     addresses_after = _address_snapshot(interface_addresses)
     keyed = key_interface_counters(counters, interface_index, addresses_after)
     stable = {}
@@ -240,20 +279,30 @@ class DataCollector:
         self.last_time = time.monotonic()
         self._proc_cache = {}
         self._fast = FastTelemetry()
+        self._data_disk_io_enabled = True
 
         # Let the fast CPU parser run once to establish a baseline for deltas
         self._fast.get_cpu_percent()
 
     def get_cpu(self):
-        global_pct, per_core = self._fast.get_cpu_percent()
+        try:
+            global_pct, per_core = self._fast.get_cpu_percent()
+        except (AttributeError, OSError, TypeError, ValueError, psutil.Error):
+            global_pct, per_core = 0.0, []
         core_ids = list(getattr(self._fast, '_last_cpu_ids', range(len(per_core))))
         # Fallback to psutil if /proc isn't available
         if global_pct == 0.0 and not per_core:
-            global_pct = psutil.cpu_percent()
-            per_core = psutil.cpu_percent(percpu=True)
+            try:
+                global_pct = psutil.cpu_percent()
+                per_core = psutil.cpu_percent(percpu=True)
+            except (OSError, psutil.Error):
+                global_pct, per_core = 0.0, []
             core_ids = list(range(len(per_core)))
 
-        cpu_freq = psutil.cpu_freq()
+        try:
+            cpu_freq = psutil.cpu_freq()
+        except (OSError, psutil.Error):
+            cpu_freq = None
         freq = cpu_freq.current if cpu_freq else 0
         return {
             "total": global_pct,
@@ -263,26 +312,37 @@ class DataCollector:
         }
 
     def get_mem(self):
-        mem_total, mem_avail, swap_total, swap_free, buffers, cached = self._fast.get_meminfo()
+        MemInfo = namedtuple(
+            'MemInfo',
+            ['total', 'available', 'percent', 'used', 'free', 'buffers', 'cached'],
+        )
+        SwapInfo = namedtuple('SwapInfo', ['total', 'used', 'free', 'percent'])
+        try:
+            mem_total, mem_avail, swap_total, swap_free, buffers, cached = (
+                self._fast.get_meminfo()
+            )
+        except (AttributeError, OSError, TypeError, ValueError, psutil.Error):
+            mem_total, mem_avail, swap_total, swap_free, buffers, cached = (0,) * 6
 
         if mem_total == 0:
             # Fallback
-            mem = psutil.virtual_memory()
-            swap = psutil.swap_memory()
+            try:
+                mem = psutil.virtual_memory()
+                swap = psutil.swap_memory()
+            except (OSError, psutil.Error):
+                mem = MemInfo(0, 0, 0.0, 0, 0, 0, 0)
+                swap = SwapInfo(0, 0, 0, 0.0)
             return {"mem": mem, "swap": swap}
 
         mem_used = mem_total - mem_avail
         mem_pct = round((mem_used / mem_total) * 100, 1) if mem_total > 0 else 0.0
 
+        swap_free = min(swap_total, max(0, swap_free))
         swap_used = swap_total - swap_free
         swap_pct = round((swap_used / swap_total) * 100, 1) if swap_total > 0 else 0.0
         mem_free = getattr(self._fast, '_last_mem_free', None)
         if not isinstance(mem_free, (int, float)):
             mem_free = mem_avail
-
-        # Create namedtuples matching psutil format
-        MemInfo = namedtuple('MemInfo', ['total', 'available', 'percent', 'used', 'free', 'buffers', 'cached'])
-        SwapInfo = namedtuple('SwapInfo', ['total', 'used', 'free', 'percent'])
 
         mem = MemInfo(total=mem_total, available=mem_avail, percent=mem_pct, used=mem_used, free=mem_free, buffers=buffers, cached=cached)
         swap = SwapInfo(total=swap_total, used=swap_used, free=swap_free, percent=swap_pct)
@@ -291,22 +351,32 @@ class DataCollector:
 
     def get_disk(self):
         disks = []
-        for p in psutil.disk_partitions():
-            if 'loop' in p.device: continue
-            try:
-                usage = psutil.disk_usage(p.mountpoint)
-                disks.append({
-                    "mount": _redact_private_tokens(p.mountpoint),
-                    "device": _public_storage_source(p.device),
-                    "_device_name": os.path.basename(os.path.realpath(p.device)),
-                    "filesystem": getattr(p, 'fstype', None) or None,
-                    "total": usage.total, "used": usage.used,
-                    "free": usage.free, "percent": usage.percent,
-                })
-            except (OSError, PermissionError):
-                pass
+        try:
+            partitions = psutil.disk_partitions()
+            for p in partitions:
+                try:
+                    device = getattr(p, 'device', None)
+                    mountpoint = getattr(p, 'mountpoint', None)
+                    if not isinstance(device, str) or not isinstance(mountpoint, str):
+                        continue
+                    if 'loop' in device.casefold():
+                        continue
+                    usage = psutil.disk_usage(mountpoint)
+                    disks.append({
+                        "mount": _redact_private_tokens(mountpoint),
+                        "device": _public_storage_source(device),
+                        "_device_name": os.path.basename(os.path.realpath(device)),
+                        "filesystem": getattr(p, 'fstype', None) or None,
+                        "total": usage.total, "used": usage.used,
+                        "free": usage.free, "percent": usage.percent,
+                    })
+                except (OSError, AttributeError, TypeError, ValueError, psutil.Error):
+                    continue
+        except (OSError, AttributeError, TypeError, ValueError, psutil.Error):
+            # A disappearing mount table must not make the whole sample fail.
+            pass
 
-        r_io, w_io = self._fast.get_disk_io()
+        r_io, w_io = self._get_disk_io()
         devices = self._get_disk_devices()
         for partition in disks:
             partition_name = partition.pop('_device_name')
@@ -326,6 +396,120 @@ class DataCollector:
             "devices": devices,
             "zram": self._get_zram(),
         }
+
+    @staticmethod
+    def _is_virtual_disk_name(name):
+        return isinstance(name, str) and name.startswith(('loop', 'ram', 'zram'))
+
+    def _reset_disk_io_baseline(self, current_time):
+        self._data_disk_io_prev = {}
+        self._data_disk_io_time = current_time
+        return 0, 0
+
+    def _get_disk_io(self):
+        """Return physical-device disk rates while keeping transient /proc failures cold.
+
+        The fast collector historically returned an aggregate that could include
+        zram and retained its previous sample if diskstats temporarily vanished.
+        Keep the fast method as the fallback for lightweight test doubles and
+        non-Linux callers, but use a small data-layer tracker for the normal
+        FastTelemetry implementation.
+        """
+        fast = getattr(self, '_fast', None)
+        use_data_layer = getattr(
+            self, '_data_disk_io_enabled', isinstance(fast, FastTelemetry),
+        )
+        if not use_data_layer or not isinstance(fast, FastTelemetry):
+            try:
+                rates = fast.get_disk_io()
+                if (isinstance(rates, (tuple, list)) and len(rates) == 2
+                        and all(isinstance(rate, (int, float)) and math.isfinite(rate)
+                                for rate in rates)):
+                    return rates
+            except (AttributeError, OSError, TypeError, ValueError, psutil.Error):
+                pass
+            return 0, 0
+
+        current_time = time.monotonic()
+        previous_time = getattr(self, '_data_disk_io_time', current_time)
+        dt = current_time - previous_time
+        if dt <= 0:
+            dt = 1.0
+
+        proc_path = getattr(fast_telemetry, 'PROC_PATH', '/proc')
+        sys_path = SYS_PATH
+        try:
+            fingerprints = fast_telemetry._snapshot_block_fingerprints(sys_path)
+        except (AttributeError, OSError, TypeError, ValueError):
+            fingerprints = None
+        if fingerprints is None:
+            return self._reset_disk_io_baseline(current_time)
+
+        disk_stats = {}
+        try:
+            with open(os.path.join(proc_path, 'diskstats'), 'rb') as stream:
+                for line in stream:
+                    parts = line.split()
+                    if len(parts) < 14:
+                        continue
+                    try:
+                        device_number = (int(parts[0]), int(parts[1]))
+                        device_name = parts[2].decode('ascii')
+                        read_sectors = int(parts[5])
+                        write_sectors = int(parts[9])
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                    if self._is_virtual_disk_name(device_name):
+                        continue
+                    disk_stats[device_number] = (
+                        device_name, read_sectors, write_sectors,
+                    )
+        except (OSError, TypeError, ValueError):
+            return self._reset_disk_io_baseline(current_time)
+
+        try:
+            selected_devices = fast_telemetry.select_root_block_devices(
+                [values[0] for values in disk_stats.values()], sys_path,
+            )
+        except (OSError, TypeError, ValueError):
+            selected_devices = None
+        if selected_devices is None:
+            return self._reset_disk_io_baseline(current_time)
+        selected_devices = {
+            name for name in selected_devices
+            if not self._is_virtual_disk_name(name)
+        }
+
+        current_disk_rw = {}
+        for device_number, (device_name, read_sectors, write_sectors) in disk_stats.items():
+            if device_name not in selected_devices:
+                continue
+            try:
+                fingerprint = fast_telemetry._block_device_fingerprint(device_name, sys_path)
+            except (AttributeError, OSError, TypeError, ValueError):
+                fingerprint = None
+            if fingerprint is None or fingerprints.get(device_name) != fingerprint:
+                return self._reset_disk_io_baseline(current_time)
+            identity = (*device_number, fingerprint)
+            current_disk_rw[identity] = (read_sectors, write_sectors)
+
+        previous = getattr(self, '_data_disk_io_prev', {})
+        if not hasattr(previous, 'get'):
+            previous = {}
+        read_rate = 0.0
+        write_rate = 0.0
+        for identity, (read_sectors, write_sectors) in current_disk_rw.items():
+            old = previous.get(identity)
+            if old is None:
+                continue
+            if read_sectors >= old[0]:
+                read_rate += (read_sectors - old[0]) * DISK_SECTOR_BYTES / dt
+            if write_sectors >= old[1]:
+                write_rate += (write_sectors - old[1]) * DISK_SECTOR_BYTES / dt
+
+        self._data_disk_io_prev = current_disk_rw
+        self._data_disk_io_time = current_time
+        return read_rate, write_rate
 
     @staticmethod
     def _read_sys_text(path):
@@ -407,42 +591,74 @@ class DataCollector:
 
     def get_net(self):
         current_time = time.monotonic()
-        dt = current_time - self.last_time
+        previous_time = getattr(self, 'last_time', current_time)
+        try:
+            dt = current_time - previous_time
+        except TypeError:
+            dt = 0.0
         interface_index = getattr(self, '_interface_index', socket.if_nametoindex)
-        current = _sample_interface_counters(
-            interface_index, getattr(self, '_interface_addresses', None),
-        )
+        try:
+            current = _sample_interface_counters(
+                interface_index, getattr(self, '_interface_addresses', None),
+            )
+        except (OSError, AttributeError, TypeError, ValueError, psutil.Error):
+            current = {}
         try:
             link_stats = psutil.net_if_stats()
-        except (OSError, AttributeError):
+        except (OSError, AttributeError, TypeError, psutil.Error):
+            link_stats = {}
+        if not hasattr(link_stats, 'get'):
             link_stats = {}
         previous = getattr(self, '_last_net_by_interface', {})
+        if not hasattr(previous, 'get'):
+            previous = {}
         interfaces = []
-        for identity, counters in sorted(current.items()):
-            name = identity[0]
-            if name == 'lo':
+        try:
+            current_items = sorted(current.items())
+        except (AttributeError, TypeError, ValueError):
+            current_items = []
+        for item in current_items:
+            try:
+                identity, counters = item
+                name = identity[0]
+                link_identity = identity[2]
+                if not isinstance(name, str) or name == 'lo':
+                    continue
+                bytes_recv = getattr(counters, 'bytes_recv')
+                bytes_sent = getattr(counters, 'bytes_sent')
+                if (not isinstance(bytes_recv, (int, float))
+                        or not isinstance(bytes_sent, (int, float))
+                        or not math.isfinite(bytes_recv)
+                        or not math.isfinite(bytes_sent)
+                        or bytes_recv < 0 or bytes_sent < 0):
+                    continue
+                old = previous.get(identity)
+                down = 0
+                up = 0
+                if old is not None and link_identity is not None and dt > 0:
+                    old_recv = getattr(old, 'bytes_recv', None)
+                    old_sent = getattr(old, 'bytes_sent', None)
+                    if (isinstance(old_recv, (int, float)) and math.isfinite(old_recv)
+                            and bytes_recv >= old_recv):
+                        down = (bytes_recv - old_recv) / dt
+                    if (isinstance(old_sent, (int, float)) and math.isfinite(old_sent)
+                            and bytes_sent >= old_sent):
+                        up = (bytes_sent - old_sent) / dt
+                stats = link_stats.get(name)
+                speed = getattr(stats, 'speed', None)
+                mtu = getattr(stats, 'mtu', None)
+                interfaces.append({
+                    "name": _public_interface_name(name),
+                    "down": down,
+                    "up": up,
+                    "total_down": bytes_recv,
+                    "total_up": bytes_sent,
+                    "is_up": getattr(stats, 'isup', None),
+                    "speed_mbps": speed if isinstance(speed, (int, float)) and speed > 0 else None,
+                    "mtu": mtu if isinstance(mtu, (int, float)) and mtu > 0 else None,
+                })
+            except (OSError, AttributeError, IndexError, TypeError, ValueError, psutil.Error):
                 continue
-            old = previous.get(identity)
-            down = 0
-            up = 0
-            if old is not None and identity[2] is not None and dt > 0:
-                if counters.bytes_recv >= old.bytes_recv:
-                    down = (counters.bytes_recv - old.bytes_recv) / dt
-                if counters.bytes_sent >= old.bytes_sent:
-                    up = (counters.bytes_sent - old.bytes_sent) / dt
-            stats = link_stats.get(name)
-            speed = getattr(stats, 'speed', None)
-            mtu = getattr(stats, 'mtu', None)
-            interfaces.append({
-                "name": _public_interface_name(name),
-                "down": down,
-                "up": up,
-                "total_down": counters.bytes_recv,
-                "total_up": counters.bytes_sent,
-                "is_up": getattr(stats, 'isup', None),
-                "speed_mbps": speed if isinstance(speed, (int, float)) and speed > 0 else None,
-                "mtu": mtu if isinstance(mtu, (int, float)) and mtu > 0 else None,
-            })
 
         self._last_net_by_interface = current
         self.last_time = current_time
@@ -608,58 +824,127 @@ class DataCollector:
         except Exception:
             total_mem = 0
 
-        procs = self._fast.get_procs(total_mem_bytes=total_mem)
+        try:
+            procs = self._fast.get_procs(total_mem_bytes=total_mem)
+        except (OSError, TypeError, ValueError, psutil.Error):
+            # A restricted procfs is expected in some containers.  Fall back
+            # to psutil rather than losing the complete process panel.
+            procs = []
 
         # Fallback to psutil if empty (e.g. not on Linux)
         if not procs:
             procs = []
-            for p in psutil.process_iter([
-                    'pid', 'ppid', 'name', 'username', 'cpu_percent',
-                    'memory_percent', 'cmdline', 'memory_info']):
-                try:
-                    info = p.info
-                    uid = None
+            try:
+                process_iter = psutil.process_iter([
+                        'pid', 'ppid', 'name', 'username', 'cpu_percent',
+                        'memory_percent', 'cmdline', 'memory_info'])
+                for index, p in enumerate(process_iter):
+                    if index >= MAX_FALLBACK_PROCESS_COUNT:
+                        break
                     try:
-                        uid = p.uids().real
-                    except (AttributeError, NotImplementedError, psutil.NoSuchProcess,
-                            psutil.AccessDenied, psutil.ZombieProcess):
+                        info = p.info
+                        uid = None
+                        try:
+                            uid = p.uids().real
+                        except (AttributeError, NotImplementedError, psutil.NoSuchProcess,
+                                psutil.AccessDenied, psutil.ZombieProcess):
+                            pass
+                        username = info.get('username')
+                        if not isinstance(username, str) or not username:
+                            username = str(uid) if uid is not None else 'Unavailable'
+                        cmdline_list = info.get('cmdline')
+                        if isinstance(cmdline_list, (list, tuple)):
+                            cmdline = ' '.join(str(argument) for argument in cmdline_list)
+                        elif isinstance(cmdline_list, str):
+                            cmdline = cmdline_list
+                        else:
+                            cmdline = ''
+                        name = info.get('name')
+                        if not isinstance(name, str) or not name:
+                            name = 'unknown'
+                        memory_info = info.get('memory_info')
+                        rss = getattr(memory_info, 'rss', 0)
+                        if not isinstance(rss, (int, float)):
+                            rss = 0
+                        cmdline = cmdline or name
+                        if len(cmdline) > MAX_PROCESS_CMDLINE_CHARS:
+                            cmdline = cmdline[:MAX_PROCESS_CMDLINE_CHARS - 3].rstrip() + '...'
+                        procs.append({
+                            'pid': info['pid'],
+                            'ppid': info.get('ppid'),
+                            'name': name,
+                            'uid': uid,
+                            'start_time': None,
+                            'username': username,
+                            'cmdline': cmdline,
+                            'cpu_percent': info.get('cpu_percent') or 0.0,
+                            'memory_percent': info.get('memory_percent') or 0.0,
+                            'rss': rss,
+                        })
+                    except (
+                        AttributeError, KeyError, OSError,
+                        psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess,
+                    ):
                         pass
-                    username = info.get('username')
-                    if not isinstance(username, str) or not username:
-                        username = str(uid) if uid is not None else 'Unavailable'
-                    cmdline_list = info.get('cmdline')
-                    if isinstance(cmdline_list, (list, tuple)):
-                        cmdline = ' '.join(str(argument) for argument in cmdline_list)
-                    elif isinstance(cmdline_list, str):
-                        cmdline = cmdline_list
-                    else:
-                        cmdline = ''
-                    name = info.get('name')
-                    if not isinstance(name, str) or not name:
-                        name = 'unknown'
-                    memory_info = info.get('memory_info')
-                    rss = getattr(memory_info, 'rss', 0)
-                    if not isinstance(rss, (int, float)):
-                        rss = 0
-                    procs.append({
-                        'pid': info['pid'],
-                        'ppid': info.get('ppid'),
-                        'name': name,
-                        'uid': uid,
-                        'start_time': None,
-                        'username': username,
-                        'cmdline': cmdline or name,
-                        'cpu_percent': info.get('cpu_percent') or 0.0,
-                        'memory_percent': info.get('memory_percent') or 0.0,
-                        'rss': rss,
-                    })
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    pass
+            except (AttributeError, KeyError, OSError, psutil.Error, TypeError, ValueError):
+                pass
 
         return prepare_processes(procs, sort_by, filter_str, tree, limit)
 
+    @staticmethod
+    def _parse_listening_tcp(lines):
+        """Parse listening TCP rows independently so one bad row is harmless."""
+        connections = []
+        for line in lines:
+            try:
+                parts = line.split()
+                if not parts or parts[0].rstrip(':').casefold() == 'sl':
+                    continue
+                if len(parts) < 4 or parts[3].casefold() != '0a':
+                    continue
+                endpoint = parts[1]
+                if isinstance(endpoint, bytes):
+                    endpoint = endpoint.decode('ascii')
+                port = int(endpoint.rsplit(':', 1)[1], 16)
+                if not 0 <= port <= 65535:
+                    continue
+            except (AttributeError, IndexError, TypeError, UnicodeDecodeError, ValueError):
+                continue
+            connections.append({'port': port, 'proto': 'TCP'})
+            if len(connections) >= MAX_CONNECTIONS:
+                break
+        return connections
+
     def get_connections(self):
-        return self._fast.get_connections()
+        fast = getattr(self, '_fast', None)
+        if not isinstance(fast, FastTelemetry):
+            # Keep lightweight collector doubles and non-standard backends
+            # compatible with the original delegation behavior.
+            try:
+                return fast.get_connections()
+            except (AttributeError, OSError, TypeError, ValueError, psutil.Error):
+                return []
+
+        proc_path = getattr(fast_telemetry, 'PROC_PATH', '/proc')
+        try:
+            with open(os.path.join(proc_path, 'net', 'tcp'), 'r',
+                      encoding='ascii', errors='replace') as stream:
+                return self._parse_listening_tcp(stream)
+        except (OSError, TypeError, ValueError):
+            return []
 
     def get_sys_info(self):
         return self._fast.get_sys_info()
+
+    def close(self):
+        """Release the long-lived procfs readers owned by this collector."""
+        fast = getattr(self, '_fast', None)
+        close = getattr(fast, 'close', None)
+        if callable(close):
+            close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

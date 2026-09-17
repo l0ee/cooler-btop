@@ -22,6 +22,69 @@ from .ui import (
 from .data import DataCollector, prepare_processes
 
 
+# A lower bound prevents a command-line typo from turning the sampler into a
+# busy loop.  A day is long enough for a paused-looking monitor while still
+# keeping the interval in a range Textual can represent predictably.
+MIN_REFRESH_INTERVAL = 0.1
+MAX_REFRESH_INTERVAL = 86400.0
+MAX_LOG_RETENTION_ROWS = 10_000_000
+
+
+def _validate_refresh_interval(value):
+    """Return a usable refresh interval or raise a user-facing ValueError."""
+    try:
+        interval = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("interval must be a finite number") from error
+    if not math.isfinite(interval):
+        raise ValueError("interval must be a finite number")
+    if not MIN_REFRESH_INTERVAL <= interval <= MAX_REFRESH_INTERVAL:
+        raise ValueError(
+            f"interval must be between {MIN_REFRESH_INTERVAL:g} and "
+            f"{MAX_REFRESH_INTERVAL:g} seconds"
+        )
+    return interval
+
+
+def _validate_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("port must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return port
+
+
+def _validate_log_retention(value):
+    try:
+        rows = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("log retention must be an integer") from error
+    if not 1 <= rows <= MAX_LOG_RETENTION_ROWS:
+        raise ValueError(
+            f"log retention must be between 1 and {MAX_LOG_RETENTION_ROWS} rows"
+        )
+    return rows
+
+
+def _parse_interval(value):
+    """argparse adapter with a readable diagnostic for invalid intervals."""
+    try:
+        return _validate_refresh_interval(value)
+    except ValueError as error:
+        import argparse
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _status_url(host, port):
+    """Build a status URL, including brackets when *host* is IPv6."""
+    host = str(host)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{int(port)}/api/metrics"
+
+
 def _read_process_identity(pid):
     """Return the process owner and kernel start tick for PID reuse checks."""
     proc_dir = os.path.join(os.environ.get('HOST_PROC', '/proc'), str(pid))
@@ -91,7 +154,8 @@ MetricWidget { scrollbar-gutter: stable; }
 .compact #diagnostics { grid-size: 2; grid-columns: 1fr 1fr; grid-rows: 10 9 7; height: 28; }
 .compact #disk { column-span: 2; }
 .compact #conns { column-span: 1; }
-.narrow #overview { grid-size: 1; grid-columns: 1fr; grid-rows: 9 9; grid-gutter: 1; height: 19; }
+.narrow #overview { grid-size: 1; grid-columns: 1fr; grid-rows: 4 4; grid-gutter: 1; height: 9; }
+.narrow #proc { height: 10; }
 .narrow #diagnostics { grid-size: 1; grid-columns: 1fr; grid-rows: 10 10 9 7 7; height: 47; }
 .narrow #disk, .narrow #conns { column-span: 1; }
 DataTable { height: 1fr; background: $surface; color: $text; }
@@ -158,7 +222,7 @@ class BtopCloneApp(App):
         ))
         self.theme = "cooler"
         self.collector = collector
-        self.refresh_interval = refresh_interval if math.isfinite(refresh_interval) and refresh_interval > 0 else 1.0
+        self.refresh_interval = _validate_refresh_interval(refresh_interval)
         self.show_pet = show_pet
         self.proc_filter = ""
         self.sort_key = "cpu_percent"
@@ -279,17 +343,25 @@ class BtopCloneApp(App):
         self.sample_error = error
         if snapshot is not None:
             sampled = datetime.datetime.now()
-            if self.recording:
-                self.capture.append((sampled, deepcopy(snapshot)))
-                if len(self.capture) >= self.capture_limit:
-                    self.recording = False
-                    self.notify("Recording full. Press e to replay.")
-            self._display_snapshot(snapshot, sampled)
+            try:
+                if self.recording:
+                    self.capture.append((sampled, deepcopy(snapshot)))
+                    if len(self.capture) >= self.capture_limit:
+                        self.recording = False
+                        self.notify("Recording full. Press e to replay.")
+                self._display_snapshot(snapshot, sampled)
+            except Exception as exc:
+                # Collector calls happen in a worker, but widgets render on the
+                # app thread.  Keep a bad/partial snapshot from terminating the
+                # whole TUI and make the next timer tick retry it.
+                self.sample_error = f"RenderError: {type(exc).__name__}: {exc}"
+                self._update_context()
         else:
             self._update_context()
 
     def _display_snapshot(self, snapshot, sampled):
-        self.last_sample = sampled
+        if not isinstance(snapshot, dict):
+            raise TypeError("sample must be a mapping")
         self.sysinfo.sys_data = snapshot['sys']
         self.cpu.cpu_data = snapshot['cpu']
         self.mem.mem_data = snapshot['mem']
@@ -305,6 +377,10 @@ class BtopCloneApp(App):
         brand.append(f" / {snapshot['sys']['hostname']}", style=MUTED)
         self.brand.update(brand)
         self._refresh_processes()
+        # Commit the sample timestamp only after every widget has accepted the
+        # frame.  A partially rendered frame must not enable process actions.
+        self.last_sample = sampled
+        self._update_context()
 
     def action_toggle_record(self):
         if self.replay_index is not None:
@@ -390,13 +466,14 @@ class BtopCloneApp(App):
         retry = f"RETRY {self.sample_error.partition(':')[0]}" if self.sample_error else ""
         state = "PAUSED" if self.paused else retry if self.sample_error else "LIVE" if self.last_sample else "STARTING"
         if self.replay_index is not None:
-            state = f"REPLAY {'PAUSED ' if self.paused else ''}{self.replay_index + 1}/{len(self.capture)} @ {self.last_sample:%H:%M:%S}"
+            sampled = self.last_sample.strftime('%H:%M:%S') if self.last_sample else 'waiting'
+            state = f"REPLAY {'PAUSED ' if self.paused else ''}{self.replay_index + 1}/{len(self.capture)} @ {sampled}"
         elif self.recording:
             state += f" / REC {len(self.capture)}/{self.capture_limit}"
         text = Text(f"{state} {self.refresh_interval:g}s", style=f"bold {AMBER if self.paused or self.sample_error else MINT}")
         text.append(f"  |  {sort} high  |  {mode}  |  {count}/{total} PIDs", style=MUTED)
         text.append(f"  |  filter: {self.proc_filter or 'off'}", style=MINT if self.proc_filter else MUTED)
-        if self.size.width >= 110:
+        if getattr(self.size, "width", 0) >= 110:
             sampled = self.last_sample.strftime('%H:%M:%S') if self.last_sample else 'waiting'
             text.append(f"  |  sampled {sampled}", style=MUTED)
         self.context.update(text)
@@ -555,24 +632,75 @@ def _run_tui(args):
     return 0
 
 
+def _run_daemon(args):
+    """Start the daemon and turn startup failures into a normal CLI result."""
+    try:
+        from .server import run_server
+
+        server_args = dict(
+            host=args.host,
+            port=args.port,
+            db_path=args.log_db,
+            interval=args.interval,
+        )
+        if args.auth_token is not None:
+            server_args['auth_token'] = args.auth_token
+        if args.privacy_mode:
+            server_args['privacy_mode'] = True
+        if args.log_retention is not None:
+            server_args['log_retention'] = args.log_retention
+        result = run_server(**server_args)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as error:
+        print(
+            f"Cooler btop daemon could not start.\n{type(error).__name__}: {error}\n"
+            "Check the bind address, port, permissions, and interval, then retry.\n"
+            "Report reproducible failures at "
+            "https://github.com/l0ee/cooler-btop/issues",
+            file=sys.stderr,
+        )
+        return 1
+    return 0 if result is None else result
+
+
 def run_cli():
     import argparse
     parser = argparse.ArgumentParser(description="Cooler btop v2")
     parser.add_argument("--desktop", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--daemon", "--serve", action="store_true", help="Run in headless web server mode")
     parser.add_argument("--host", default="127.0.0.1", help="Daemon bind address (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8080, help="Port for the web server")
+    parser.add_argument("--port", type=_validate_port, default=8080, help="Port for the web server")
     parser.add_argument("--log-db", type=str, default=None, help="Path to SQLite DB for historical metrics logging (Daemon mode only)")
-    parser.add_argument("--interval", type=float, default=1.0, help="Update interval in seconds (default: 1.0)")
+    parser.add_argument(
+        "--log-retention", type=_validate_log_retention, default=None,
+        help="Maximum number of SQLite metric rows to retain",
+    )
+    parser.add_argument(
+        "--auth-token", default=None,
+        help="Bearer token for the daemon API; required for non-loopback binds",
+    )
+    parser.add_argument(
+        "--privacy-mode", "--mask-process-args", action="store_true",
+        help="Replace process command arguments with process names in daemon API data",
+    )
+    parser.add_argument(
+        "--interval", type=_parse_interval, default=1.0,
+        help=f"Update interval in seconds ({MIN_REFRESH_INTERVAL:g}-{MAX_REFRESH_INTERVAL:g}; default: 1.0)",
+    )
     parser.add_argument("--no-pet", action="store_true", help="Disable the animated ASCII pet in the TUI")
     parser.add_argument("--version", action="version", version="Cooler btop v2.0.0", help="Print version and exit")
     parser.add_argument("--status", action="store_true", help="Query the local daemon and print a CLI status summary")
     args = parser.parse_args()
 
     if args.status:
-        import requests
         try:
-            r = requests.get(f"http://localhost:{args.port}/api/metrics", timeout=2)
+            import requests
+            request_options = {'timeout': 2}
+            token = args.auth_token or os.environ.get('COOLER_BTOP_AUTH_TOKEN')
+            if token:
+                request_options['headers'] = {'Authorization': f'Bearer {token}'}
+            r = requests.get(_status_url(args.host, args.port), **request_options)
             if r.status_code == 200:
                 data = r.json()
                 print(f"Cooler Btop Daemon: ONLINE (Port {args.port})")
@@ -587,14 +715,7 @@ def run_cli():
             return 1
 
     if args.daemon:
-        from .server import run_server
-        result = run_server(
-            host=args.host,
-            port=args.port,
-            db_path=args.log_db,
-            interval=args.interval,
-        )
-        return 0 if result is None else result
+        return _run_daemon(args)
     else:
         return _run_tui(args)
 

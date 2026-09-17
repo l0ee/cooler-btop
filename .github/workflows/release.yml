@@ -11,6 +11,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container: fedora:44
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      version: ${{ steps.project_version.outputs.version }}
 
     steps:
     - name: Install Fedora build dependencies
@@ -33,11 +41,13 @@ jobs:
           python3-wheel \
           rpm-build
 
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
     - name: Require tag to match project version
+      id: project_version
       run: |
         expected_tag="v$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+        echo "version=${expected_tag#v}" >> "$GITHUB_OUTPUT"
         test "$GITHUB_REF_NAME" = "$expected_tag"
 
     - name: Build and validate release artifacts
@@ -45,6 +55,11 @@ jobs:
 
     - name: Verify release checksums
       run: cd dist && sha256sum --check SHA256SUMS
+
+    - name: Attest release artifacts
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-checksums: dist/SHA256SUMS
 
     - name: Confirm package was not installed
       run: |
@@ -56,26 +71,27 @@ jobs:
         test "$query_output" = "package cooler-btop is not installed"
 
     - name: Upload release artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: release-files
         path: |
-          dist/cooler-btop-2.0.0-1.fc44.noarch.rpm
-          dist/cooler-btop-2.0.0-1.fc44.src.rpm
-          dist/cooler_btop-2.0.0-py3-none-any.whl
-          dist/cooler_btop-2.0.0.tar.gz
+          dist/cooler-btop-${{ steps.project_version.outputs.version }}-1.fc44.noarch.rpm
+          dist/cooler-btop-${{ steps.project_version.outputs.version }}-1.fc44.src.rpm
+          dist/cooler_btop-${{ steps.project_version.outputs.version }}-py3-none-any.whl
+          dist/cooler_btop-${{ steps.project_version.outputs.version }}.tar.gz
           dist/SHA256SUMS
         if-no-files-found: error
 
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
     - name: Download release artifacts
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
       with:
         name: release-files
         path: dist
@@ -92,9 +108,9 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: >-
         gh release create "$GITHUB_REF_NAME"
-        dist/cooler-btop-2.0.0-1.fc44.noarch.rpm
-        dist/cooler-btop-2.0.0-1.fc44.src.rpm
-        dist/cooler_btop-2.0.0-py3-none-any.whl
-        dist/cooler_btop-2.0.0.tar.gz
+        dist/cooler-btop-${{ needs.build.outputs.version }}-1.fc44.noarch.rpm
+        dist/cooler-btop-${{ needs.build.outputs.version }}-1.fc44.src.rpm
+        dist/cooler_btop-${{ needs.build.outputs.version }}-py3-none-any.whl
+        dist/cooler_btop-${{ needs.build.outputs.version }}.tar.gz
         dist/SHA256SUMS
         --verify-tag --generate-notes

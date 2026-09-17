@@ -52,8 +52,9 @@ class TestMetricsServer(unittest.TestCase):
         log_patcher.start()
         self.addCleanup(log_patcher.stop)
 
-    def start_server(self, interval=60.0, logger=None, wait=True):
+    def start_server(self, interval=60.0, logger=None, wait=True, **options):
         kwargs = {} if interval is None else {'interval': interval}
+        kwargs.update(options)
         self.server = server.MetricsServer(
             ('127.0.0.1', 0), server.MetricsHandler, self.collector, logger, **kwargs,
         )
@@ -194,6 +195,100 @@ class TestMetricsServer(unittest.TestCase):
         self.assertEqual(headers['Referrer-Policy'], 'no-referrer')
         self.assertEqual(int(headers['Content-Length']), len(compressed))
         self.assertEqual(gzip.decompress(compressed), payload)
+
+    def test_gzip_quality_zero_is_respected(self):
+        self.start_server()
+        for encoding in ('gzip;q=0', 'br, gzip;q=0', '*;q=1, gzip;q=0'):
+            with self.subTest(encoding=encoding):
+                status, headers, payload = self.request(
+                    '/api/metrics', headers={'Accept-Encoding': encoding},
+                )
+                self.assertEqual(status, 200)
+                self.assertNotIn('Content-Encoding', headers)
+                self.assertTrue(payload.startswith(b'{'))
+
+    def test_authentication_is_required_when_configured_and_supports_cookie(self):
+        self.start_server(auth_token='test-secret')
+        status, headers, _ = self.request('/api/metrics')
+        self.assertEqual(status, 401)
+        self.assertEqual(headers['WWW-Authenticate'], 'Bearer')
+
+        status, _, payload = self.request(
+            '/api/metrics', headers={'Authorization': 'Bearer test-secret'},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)['sys']['hostname'], 'test-host')
+
+        status, headers, _ = self.request('/?token=test-secret')
+        self.assertEqual(status, 200)
+        cookie = headers['Set-Cookie'].split(';', 1)[0]
+        self.assertEqual(self.request('/api/metrics', headers={'Cookie': cookie})[0], 200)
+
+    def test_non_loopback_bind_requires_a_token(self):
+        with self.assertRaisesRegex(ValueError, 'non-loopback'):
+            server.MetricsServer(
+                ('0.0.0.0', 0), server.MetricsHandler, self.collector,
+            )
+
+        protected = server.MetricsServer(
+            ('0.0.0.0', 0), server.MetricsHandler, self.collector,
+            auth_token='test-secret', shutdown_timeout=0.1,
+        )
+        protected.shutdown()
+        protected.server_close()
+
+    def test_privacy_mode_masks_process_arguments_in_api_snapshot(self):
+        self.start_server(privacy_mode=True)
+        payload = json.loads(self.request('/api/metrics')[2])
+        self.assertTrue(payload['procs'])
+        for process in payload['procs']:
+            self.assertEqual(process['cmdline'], process['name'])
+
+    def test_stale_snapshot_is_not_served_as_healthy(self):
+        self.start_server(stale_after=0.01)
+        time.sleep(0.03)
+        status, headers, body = self.request('/api/metrics')
+        self.assertEqual(status, 503)
+        self.assertEqual(headers['Retry-After'], '60')
+        self.assertEqual(json.loads(body)['status'], 'error')
+
+    def test_stream_client_limit_returns_retryable_error(self):
+        self.start_server(max_stream_clients=1)
+        first = self.open_stream()
+        status, headers, body = self.request('/api/metrics/stream')
+        self.assertEqual(status, 503)
+        self.assertEqual(headers['Retry-After'], '60')
+        self.assertEqual(json.loads(body)['message'], 'Too many metric streams')
+        self.assertGreaterEqual(self.server._stream_clients, 1)
+        first.close()
+
+    def test_bounded_shutdown_returns_while_collector_is_blocked(self):
+        release = threading.Event()
+
+        def blocked_cpu():
+            release.wait(timeout=3)
+            return self.collector.get_cpu.return_value
+
+        self.collector.get_cpu.side_effect = blocked_cpu
+        self.start_server(wait=False, shutdown_timeout=0.05)
+        started = time.monotonic()
+        self.server.shutdown()
+        self.server.server_close()
+        self.assertLess(time.monotonic() - started, 0.8)
+        self.assertTrue(self.server._sampler.is_alive())
+        release.set()
+        self.server._sampler.join(timeout=2)
+        self.assertFalse(self.server._sampler.is_alive())
+
+    def test_database_retention_is_bounded(self):
+        logger = server.DBLogger(':memory:', max_rows=3)
+        cpu = self.collector.get_cpu.return_value
+        mem = {'mem': {'used': 2048}}
+        net = self.collector.get_net.return_value
+        for _ in range(10):
+            logger.log(cpu, mem, net)
+        self.assertEqual(logger.conn.execute('SELECT COUNT(*) FROM metrics').fetchone()[0], 3)
+        logger.close()
 
     def test_http_process_control_is_not_exposed(self):
         self.start_server()
@@ -412,6 +507,22 @@ class TestMetricsServer(unittest.TestCase):
             result = server.run_server()
         self.assertEqual(result, 1)
         fake_server.server_close.assert_called_once_with()
+
+    def test_bind_failure_closes_resources_created_before_server(self):
+        collector = mock.Mock()
+        logger = mock.Mock()
+        with mock.patch('cooler_btop.server.DataCollector', return_value=collector), \
+                mock.patch('cooler_btop.server.DBLogger', return_value=logger), \
+                mock.patch(
+                    'cooler_btop.server.MetricsServer',
+                    side_effect=ValueError('token required'),
+                ), self.assertLogs(level='ERROR'):
+            result = server.run_server(
+                host='0.0.0.0', port=8080, db_path='metrics.sqlite',
+            )
+        self.assertEqual(result, 1)
+        collector.close.assert_called_once_with()
+        logger.close.assert_called_once_with()
 
 
 class TestStressTestCleanup(unittest.TestCase):

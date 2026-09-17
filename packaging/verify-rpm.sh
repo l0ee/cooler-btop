@@ -59,6 +59,10 @@ while IFS=$'\t' read -r filename capabilities; do
     [ "$capabilities" = "(none)" ] || fail "unexpected file capability: $filename $capabilities"
 done <<< "$filecaps"
 
+if ! rpm_version=$(rpm -qp --qf '%{VERSION}' "$rpm_path"); then
+    fail "RPM version query failed"
+fi
+
 extract_dir=$(mktemp -d)
 trap 'rm -rf "$extract_dir"' EXIT HUP INT TERM
 (
@@ -112,4 +116,4 @@ launcher=$extract_dir/usr/bin/cooler-btop
 [ -x "$launcher" ] || fail "extracted cooler-btop launcher is not executable"
 
 version=$(PYTHONPATH="$site_packages" "$launcher" --version)
-[ "$version" = "Cooler btop v2.0.0" ] || fail "unexpected extracted launcher version: $version"
+[ "$version" = "Cooler btop v${rpm_version}" ] || fail "unexpected extracted launcher version: $version"

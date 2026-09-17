@@ -8,6 +8,21 @@ PROC_PATH = os.environ.get('HOST_PROC', '/proc')
 SYS_PATH = os.environ.get('HOST_SYS', '/sys')
 HOST_ROOT = os.environ.get('HOST_ROOT', '/')
 
+# Procfs and sysfs are kernel-backed pseudo-filesystems.  They normally expose
+# very small records, but a process command line is user-controlled and may be
+# as large as ARG_MAX.  Keep metadata work bounded so one process cannot make a
+# telemetry tick allocate or decode an unbounded amount of data.
+MAX_PROCESS_SCAN = 4096
+MAX_CMDLINE_BYTES = 4096
+MAX_STATUS_BYTES = 64 * 1024
+MAX_MEMINFO_BYTES = 64 * 1024
+
+# Keep all temperature sources on the same conservative validation policy.
+# Values outside this range are either malformed or not useful as a CPU/GPU
+# temperature reading, and should fall through to the next source.
+MIN_TEMPERATURE_C = -40.0
+MAX_TEMPERATURE_C = 150.0
+
 
 def select_root_block_devices(devices, sys_path=SYS_PATH):
     """Return whole physical devices without partitions or sysfs slaves."""
@@ -40,7 +55,7 @@ def _read_optional_device_id(path):
     try:
         with open(path, 'rb') as stream:
             return stream.read().strip()
-    except FileNotFoundError:
+    except OSError:
         return None
 
 
@@ -68,15 +83,25 @@ def _snapshot_block_fingerprints(sys_path=SYS_PATH):
 class FastTelemetry:
     def __init__(self):
         # Open in unbuffered binary mode
+        self._stat_file = None
+        self._mem_file = None
+        stat_file = None
+        mem_file = None
         try:
-            self._stat_file = open(f'{PROC_PATH}/stat', 'rb', buffering=0)
-            self._mem_file = open(f'{PROC_PATH}/meminfo', 'rb', buffering=0)
+            stat_file = open(f'{PROC_PATH}/stat', 'rb', buffering=0)
+            mem_file = open(f'{PROC_PATH}/meminfo', 'rb', buffering=0)
         except Exception:
+            for stream in (mem_file, stat_file):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
             self._stat_file = None
             self._mem_file = None
-
-
-        self._mem_buf = bytearray(2048)
+        else:
+            self._stat_file = stat_file
+            self._mem_file = mem_file
 
         self._last_cpu_total = 0
         self._last_cpu_idle = 0
@@ -116,6 +141,13 @@ class FastTelemetry:
         except ValueError:
             return None
         return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _valid_temperature(value):
+        try:
+            return math.isfinite(value) and MIN_TEMPERATURE_C <= value <= MAX_TEMPERATURE_C
+        except (TypeError, ValueError):
+            return False
 
     def _get_specs(self):
         if self._specs_cache is not None:
@@ -277,7 +309,7 @@ class FastTelemetry:
                     sensor_id = filename[:-6]
                     label = self._read_text(os.path.join(base, sensor_id + '_label'))
                     value = self._read_number(os.path.join(base, filename), 1000.0)
-                    if value is None or not -100 <= value <= 250:
+                    if not self._valid_temperature(value):
                         continue
                     if category == 'CPU' and label and label.casefold().startswith('core '):
                         core_values.append(value)
@@ -381,7 +413,7 @@ class FastTelemetry:
                             w_sec = int(parts[9])
                         except (UnicodeDecodeError, ValueError):
                             continue
-                        if dev.startswith('loop') or dev.startswith('ram'):
+                        if dev.startswith(('loop', 'ram', 'zram')):
                             continue
 
                         disk_stats[identity] = (dev, r_sec, w_sec)
@@ -422,8 +454,56 @@ class FastTelemetry:
 
             return dr, dw
 
-        except FileNotFoundError:
+        except OSError:
+            # A disappearing or inaccessible proc/sysfs tree must not retain a
+            # baseline from a different device set.  The next successful sample
+            # will warm the baseline and report zero deltas.
+            self._prev_disk_rw = {}
+            self._prev_disk_time = current_time
             return 0, 0
+
+    @staticmethod
+    def _read_process_uid(pid_path):
+        try:
+            with open(os.path.join(pid_path, 'status'), 'rb') as f_status:
+                status_data = f_status.read(MAX_STATUS_BYTES)
+            for status_line in status_data.splitlines():
+                if status_line.startswith(b'Uid:'):
+                    return int(status_line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+
+    @staticmethod
+    def _bound_cmdline(value, truncated=False):
+        suffix = '...'
+        encoded = value.encode('utf-8', errors='replace')
+        if not truncated and len(encoded) <= MAX_CMDLINE_BYTES:
+            return value
+        prefix_bytes = max(0, MAX_CMDLINE_BYTES - len(suffix))
+        prefix = encoded[:prefix_bytes].decode('utf-8', errors='ignore').rstrip()
+        return prefix + suffix
+
+    @staticmethod
+    def _read_process_cmdline(pid_path, fallback):
+        try:
+            with open(os.path.join(pid_path, 'cmdline'), 'rb') as f_cmdline:
+                cmdline_data = f_cmdline.read(MAX_CMDLINE_BYTES + 1)
+        except OSError:
+            return fallback
+
+        if not cmdline_data:
+            return fallback
+        truncated = len(cmdline_data) > MAX_CMDLINE_BYTES
+        if truncated:
+            cmdline_data = cmdline_data[:MAX_CMDLINE_BYTES]
+        arguments = [part for part in cmdline_data.split(b'\0') if part]
+        if not arguments:
+            return fallback
+        cmdline = ' '.join(
+            part.decode('utf-8', errors='replace') for part in arguments
+        )
+        return FastTelemetry._bound_cmdline(cmdline, truncated=truncated)
 
     def get_procs(self, total_mem_bytes=None):
         current_time = time.monotonic()
@@ -434,102 +514,97 @@ class FastTelemetry:
         new_proc_cpu = {}
 
         try:
-            for pid_str in os.listdir(PROC_PATH):
-                if not pid_str.isdigit():
-                    continue
+            # scandir keeps the directory enumeration lazy.  Limit numeric
+            # entries rather than materializing an unbounded PID list.
+            with os.scandir(PROC_PATH) as entries:
+                scanned = 0
+                for entry in entries:
+                    pid_str = entry.name
+                    if not pid_str.isdigit():
+                        continue
+                    scanned += 1
+                    if scanned > MAX_PROCESS_SCAN:
+                        break
 
-                try:
-                    with open(f'{PROC_PATH}/{pid_str}/stat', 'rb') as f_stat, \
-                         open(f'{PROC_PATH}/{pid_str}/statm', 'rb') as f_statm:
+                    pid_path = os.path.join(PROC_PATH, pid_str)
+                    try:
+                        with open(os.path.join(pid_path, 'stat'), 'rb') as f_stat, \
+                             open(os.path.join(pid_path, 'statm'), 'rb') as f_statm:
 
-                        stat_data = f_stat.read()
-                        statm_data = f_statm.read()
+                            stat_data = f_stat.read()
+                            statm_data = f_statm.read()
 
-                        lparen = stat_data.find(b'(')
-                        rparen = stat_data.rfind(b')')
-                        if lparen < 0 or rparen <= lparen:
-                            continue
+                            lparen = stat_data.find(b'(')
+                            rparen = stat_data.rfind(b')')
+                            if lparen < 0 or rparen <= lparen:
+                                continue
 
-                        name = stat_data[lparen+1:rparen].decode('utf-8', errors='replace')
-                        rest = stat_data[rparen+2:].split()
-                        if len(rest) < 13:
-                            continue
+                            name = stat_data[lparen+1:rparen].decode('utf-8', errors='replace')
+                            rest = stat_data[rparen+2:].split()
+                            if len(rest) <= 19:
+                                continue
 
-                        utime = int(rest[11])
-                        stime = int(rest[12])
-                        ppid = int(rest[1])
-                        start_time = int(rest[19]) if len(rest) > 19 else None
+                            utime = int(rest[11])
+                            stime = int(rest[12])
+                            ppid = int(rest[1])
+                            start_time = int(rest[19])
 
-                        cpu_time = (utime + stime) / self.clock_ticks
+                            cpu_time = (utime + stime) / self.clock_ticks
 
-                        cpu_percent = 0.0
-                        previous = self._prev_proc_cpu.get(pid_str)
-                        if previous is not None and start_time is not None and previous[1] == start_time:
-                            delta_c = cpu_time - previous[0]
-                            if delta_c > 0 and dt > 0:
-                                cpu_percent = (delta_c / dt) * 100.0
+                            cpu_percent = 0.0
+                            previous = self._prev_proc_cpu.get(pid_str)
+                            if previous is not None and previous[1] == start_time:
+                                delta_c = cpu_time - previous[0]
+                                if delta_c > 0 and dt > 0:
+                                    cpu_percent = (delta_c / dt) * 100.0
 
-                        statm_fields = statm_data.split()
-                        rss_pages = int(statm_fields[1])
-                        memory_rss_bytes = rss_pages * self.page_size
+                            statm_fields = statm_data.split()
+                            rss_pages = int(statm_fields[1])
+                            memory_rss_bytes = rss_pages * self.page_size
 
-                        mem_percent = 0.0
-                        if total_mem_bytes and total_mem_bytes > 0:
-                            mem_percent = (memory_rss_bytes / total_mem_bytes) * 100.0
+                            mem_percent = 0.0
+                            if total_mem_bytes and total_mem_bytes > 0:
+                                mem_percent = (memory_rss_bytes / total_mem_bytes) * 100.0
 
-                        uid = None
-                        try:
-                            with open(f'{PROC_PATH}/{pid_str}/status', 'rb') as f_status:
-                                for status_line in f_status:
-                                    if status_line.startswith(b'Uid:'):
-                                        uid = int(status_line.split()[1])
-                                        break
-                        except (OSError, ValueError, IndexError):
-                            pass
+                            uid = self._read_process_uid(pid_path)
+                            username = 'Unavailable'
+                            if uid is not None:
+                                try:
+                                    username = pwd.getpwuid(uid).pw_name
+                                except (KeyError, OverflowError, OSError):
+                                    username = str(uid)
 
-                        username = 'Unavailable'
-                        if uid is not None:
-                            try:
-                                username = pwd.getpwuid(uid).pw_name
-                            except (KeyError, OverflowError, OSError):
-                                username = str(uid)
+                            cmdline = self._read_process_cmdline(pid_path, name)
 
-                        cmdline = name
-                        try:
-                            with open(f'{PROC_PATH}/{pid_str}/cmdline', 'rb') as f_cmdline:
-                                arguments = [part for part in f_cmdline.read().split(b'\0') if part]
-                            if arguments:
-                                cmdline = ' '.join(part.decode('utf-8', errors='replace') for part in arguments)
-                        except OSError:
-                            pass
+                            with open(os.path.join(pid_path, 'stat'), 'rb') as f_stat:
+                                current_stat = f_stat.read()
+                            current_rparen = current_stat.rfind(b')')
+                            if current_rparen < 0:
+                                continue
+                            current_rest = current_stat[current_rparen+2:].split()
+                            if len(current_rest) <= 19 or int(current_rest[19]) != start_time:
+                                continue
 
-                        with open(f'{PROC_PATH}/{pid_str}/stat', 'rb') as f_stat:
-                            current_stat = f_stat.read()
-                        current_rparen = current_stat.rfind(b')')
-                        if current_rparen < 0:
-                            continue
-                        current_rest = current_stat[current_rparen+2:].split()
-                        if len(current_rest) <= 19 or int(current_rest[19]) != start_time:
-                            continue
+                            new_proc_cpu[pid_str] = (cpu_time, start_time)
 
-                        new_proc_cpu[pid_str] = (cpu_time, start_time)
+                            procs.append({
+                                'pid': int(pid_str),
+                                'ppid': ppid,
+                                'name': name,
+                                'uid': uid,
+                                'start_time': start_time,
+                                'username': username,
+                                'cmdline': cmdline,
+                                'cpu_percent': round(cpu_percent, 1),
+                                'memory_percent': round(mem_percent, 1),
+                                'rss': memory_rss_bytes
+                            })
+                    except (OSError, IndexError, ValueError):
+                        continue
 
-                        procs.append({
-                            'pid': int(pid_str),
-                            'ppid': ppid,
-                            'name': name,
-                            'uid': uid,
-                            'start_time': start_time,
-                            'username': username,
-                            'cmdline': cmdline,
-                            'cpu_percent': round(cpu_percent, 1),
-                            'memory_percent': round(mem_percent, 1),
-                            'rss': memory_rss_bytes
-                        })
-                except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError, ValueError):
-                    continue
-
-        except FileNotFoundError:
+        except OSError:
+            # Procfs can disappear, be remounted, or be denied between
+            # samples.  Return the safe empty sample and drop stale deltas.
             pass
 
         self._prev_proc_cpu = new_proc_cpu
@@ -540,28 +615,34 @@ class FastTelemetry:
     def get_connections(self):
         conns = []
         try:
-            with open(f'{PROC_PATH}/net/tcp', 'r') as f:
-                lines = f.readlines()[1:] # skip header
-                for line in lines:
+            with open(f'{PROC_PATH}/net/tcp', 'r', encoding='ascii', errors='replace') as stream:
+                next(stream, None)  # skip header
+                for line in stream:
                     parts = line.split()
-                    if len(parts) >= 10:
-                        local_ip_port = parts[1]
-                        state = parts[3]
-
-                        if state == '0A': # LISTEN state
-                            ip_hex, port_hex = local_ip_port.split(':')
-                            port = int(port_hex, 16)
-                            conns.append({'port': port, 'proto': 'TCP'})
+                    if len(parts) < 10 or parts[3].casefold() != '0a':
+                        continue
+                    try:
+                        port_hex = parts[1].rsplit(':', 1)[1]
+                        port = int(port_hex, 16)
+                    except (IndexError, ValueError):
+                        # A malformed row should not discard valid listeners
+                        # parsed before or after it.
+                        continue
+                    conns.append({'port': port, 'proto': 'TCP'})
+                    if len(conns) >= 10:
+                        break
             # Just take top 10 to keep it lightweight
             return conns[:10]
-        except (OSError, ValueError, IndexError):
+        except OSError:
             return []
 
     def _get_cpu_temperature(self, sensors=None):
         if sensors is not None:
             cpu_temperatures = [
                 sensor for sensor in sensors
-                if sensor['category'] == 'CPU' and sensor['type'] == 'temperature'
+                if sensor.get('category') == 'CPU'
+                and sensor.get('type') == 'temperature'
+                and self._valid_temperature(sensor.get('value'))
             ]
             priorities = ('CPU Tdie', 'CPU Package', 'CPU Tctl', 'CPU Cores')
             for prefix in priorities:
@@ -612,7 +693,7 @@ class FastTelemetry:
                             temperature = float(f_input.read().strip()) / 1000.0
                     except (OSError, ValueError):
                         continue
-                    if not math.isfinite(temperature):
+                    if not self._valid_temperature(temperature):
                         continue
                     hwmon_candidates.append((*priority, hwmon, filename, temperature))
         except (OSError, ValueError):
@@ -633,7 +714,7 @@ class FastTelemetry:
                         temperature = float(f_temp.read().strip()) / 1000.0
                 except (OSError, ValueError):
                     continue
-                if not math.isfinite(temperature):
+                if not self._valid_temperature(temperature):
                     continue
                 if b'x86_pkg_temp' in ztype or b'cpu' in ztype:
                     priority = 0
@@ -666,10 +747,19 @@ class FastTelemetry:
                         procs_running = int(line.split()[1])
                     elif line.startswith(b'processes'):
                         forks = int(line.split()[1])
-            procs_total = sum(
-                pid.isdigit() and os.path.isdir(f'{PROC_PATH}/{pid}')
-                for pid in os.listdir(PROC_PATH)
-            )
+            try:
+                with os.scandir(PROC_PATH) as process_entries:
+                    procs_total = 0
+                    for entry in process_entries:
+                        if not entry.name.isdigit():
+                            continue
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                procs_total += 1
+                        except OSError:
+                            continue
+            except OSError:
+                procs_total = 0
 
             sensors = self._get_sensors()
             cpu_temp = self._get_cpu_temperature(sensors)
@@ -741,12 +831,21 @@ class FastTelemetry:
                 "load_avg": "0.0 0.0 0.0"
             }
 
+    def close(self):
+        """Close procfs handles; safe to call repeatedly."""
+        for attribute in ('_stat_file', '_mem_file'):
+            stream = getattr(self, attribute, None)
+            setattr(self, attribute, None)
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except Exception:
+                pass
+
     def __del__(self):
         try:
-            if getattr(self, '_stat_file', None):
-                self._stat_file.close()
-            if getattr(self, '_mem_file', None):
-                self._mem_file.close()
+            self.close()
         except Exception:
             pass
 
@@ -754,57 +853,71 @@ class FastTelemetry:
         if not self._stat_file:
             return 0.0, []
 
-        self._stat_file.seek(0)
         per_core_percentages = []
         current_core_ids = []
         global_pct = 0.0
+        previous_global_total = self._last_cpu_total
+        previous_global_idle = self._last_cpu_idle
+        previous_per_core_total = self._last_per_core_total.copy()
+        previous_per_core_idle = self._last_per_core_idle.copy()
 
-        for line in self._stat_file:
-            fields = line.split()
-            if not fields or (fields[0] != b'cpu' and not fields[0].startswith(b'cpu')):
-                continue
-            try:
-                values = [int(value) for value in fields[1:11]]
-            except ValueError:
-                continue
-            if len(values) < 4:
-                continue
-            while len(values) < 8:
-                values.append(0)
-
-            # guest and guest_nice are already included in user and nice.
-            idle = values[3] + values[4]
-            total = max(0, sum(values[:8]) - sum(values[8:10]))
-            is_global = fields[0] == b'cpu'
-
-            if is_global:
-                idle_delta = idle - self._last_cpu_idle
-                total_delta = total - self._last_cpu_total
-                self._last_cpu_idle = idle
-                self._last_cpu_total = total
-                if total_delta > 0:
-                    global_pct = min(100.0, max(0.0, 100.0 * (total_delta - idle_delta) / total_delta))
-            else:
-                try:
-                    core_id = int(fields[0][3:])
-                except ValueError:
+        try:
+            self._stat_file.seek(0)
+            for line in self._stat_file:
+                fields = line.split()
+                if not fields or (fields[0] != b'cpu' and not fields[0].startswith(b'cpu')):
                     continue
 
-                current_core_ids.append(core_id)
-                previous_idle = self._last_per_core_idle.get(core_id)
-                previous_total = self._last_per_core_total.get(core_id)
-                self._last_per_core_idle[core_id] = idle
-                self._last_per_core_total[core_id] = total
-                if previous_idle is not None and previous_total is not None:
-                    idle_delta = idle - previous_idle
-                    total_delta = total - previous_total
+                try:
+                    values = [int(value) for value in fields[1:11]]
+                except ValueError:
+                    continue
+                if len(values) < 4:
+                    continue
+                while len(values) < 8:
+                    values.append(0)
+
+                # guest and guest_nice are already included in user and nice.
+                idle = values[3] + values[4]
+                total = max(0, sum(values[:8]) - sum(values[8:10]))
+                is_global = fields[0] == b'cpu'
+
+                if is_global:
+                    idle_delta = idle - self._last_cpu_idle
+                    total_delta = total - self._last_cpu_total
+                    self._last_cpu_idle = idle
+                    self._last_cpu_total = total
+                    if total_delta > 0:
+                        global_pct = min(100.0, max(0.0, 100.0 * (total_delta - idle_delta) / total_delta))
                 else:
-                    total_delta = 0
-                if total_delta > 0:
-                    pct = min(100.0, max(0.0, 100.0 * (total_delta - idle_delta) / total_delta))
-                    per_core_percentages.append(pct)
-                else:
-                    per_core_percentages.append(0.0)
+                    try:
+                        core_id = int(fields[0][3:])
+                    except ValueError:
+                        continue
+
+                    current_core_ids.append(core_id)
+                    previous_idle = self._last_per_core_idle.get(core_id)
+                    previous_total = self._last_per_core_total.get(core_id)
+                    self._last_per_core_idle[core_id] = idle
+                    self._last_per_core_total[core_id] = total
+                    if previous_idle is not None and previous_total is not None:
+                        idle_delta = idle - previous_idle
+                        total_delta = total - previous_total
+                    else:
+                        total_delta = 0
+                    if total_delta > 0:
+                        pct = min(100.0, max(0.0, 100.0 * (total_delta - idle_delta) / total_delta))
+                        per_core_percentages.append(pct)
+                    else:
+                        per_core_percentages.append(0.0)
+        except (OSError, ValueError):
+            # Treat a procfs read race or remount as a missing sample.  Do not
+            # expose an exception to the collector or retain partial state.
+            self._last_cpu_total = previous_global_total
+            self._last_cpu_idle = previous_global_idle
+            self._last_per_core_total = previous_per_core_total
+            self._last_per_core_idle = previous_per_core_idle
+            return 0.0, []
 
         self._last_per_core_idle = {
             core_id: self._last_per_core_idle[core_id] for core_id in current_core_ids
@@ -820,61 +933,70 @@ class FastTelemetry:
             self._last_mem_free = None
             return 0, 0, 0, 0, 0, 0
 
-        self._mem_file.seek(0)
-        n = self._mem_file.readinto(self._mem_buf)
-        if n == 0:
+        try:
+            self._mem_file.seek(0)
+            raw = self._mem_file.read(MAX_MEMINFO_BYTES)
+        except (OSError, ValueError):
+            self._last_mem_free = None
+            return 0, 0, 0, 0, 0, 0
+        if not raw:
             self._last_mem_free = None
             return 0, 0, 0, 0, 0, 0
 
-        mem_total = 0
-        mem_available = 0
-        mem_free = None
-        swap_total = 0
-        swap_free = 0
-        buffers = 0
-        cached = 0
+        values = {}
+        wanted = {
+            b'MemTotal', b'MemAvailable', b'MemFree', b'SwapTotal', b'SwapFree',
+            b'Buffers', b'Cached',
+        }
+        multipliers = {
+            b'b': 1,
+            b'kb': 1024,
+            b'kib': 1024,
+            b'mb': 1024 ** 2,
+            b'mib': 1024 ** 2,
+            b'gb': 1024 ** 3,
+            b'gib': 1024 ** 3,
+        }
+        for line in raw.splitlines():
+            key, separator, remainder = line.partition(b':')
+            if not separator:
+                continue
+            key = key.strip()
+            if key not in wanted:
+                continue
+            fields = remainder.split()
+            if not fields:
+                continue
+            try:
+                number = int(fields[0])
+            except ValueError:
+                continue
+            if number < 0:
+                continue
+            unit = fields[1].lower() if len(fields) > 1 else b'kb'
+            multiplier = multipliers.get(unit)
+            if multiplier is None:
+                continue
+            values[key] = number * multiplier
 
-        cursor = 0
-        while cursor < n:
-            if self._mem_buf[cursor:cursor+8] == b'MemTotal':
-                mem_total = self._parse_mem_val(cursor, n)
-            elif self._mem_buf[cursor:cursor+12] == b'MemAvailable':
-                mem_available = self._parse_mem_val(cursor, n)
-            elif self._mem_buf[cursor:cursor+7] == b'MemFree':
-                mem_free = self._parse_mem_val(cursor, n)
-            elif self._mem_buf[cursor:cursor+9] == b'SwapTotal':
-                swap_total = self._parse_mem_val(cursor, n)
-            elif self._mem_buf[cursor:cursor+8] == b'SwapFree':
-                swap_free = self._parse_mem_val(cursor, n)
-            elif self._mem_buf[cursor:cursor+7] == b'Buffers':
-                buffers = self._parse_mem_val(cursor, n)
-            elif self._mem_buf[cursor:cursor+6] == b'Cached':
-                cached = self._parse_mem_val(cursor, n)
+        mem_total = values.get(b'MemTotal', 0)
+        mem_free = values.get(b'MemFree')
+        mem_available = values.get(b'MemAvailable')
+        swap_total = values.get(b'SwapTotal', 0)
+        swap_free = values.get(b'SwapFree', 0)
+        swap_free = min(swap_total, max(0, swap_free))
+        buffers = values.get(b'Buffers', 0)
+        cached = values.get(b'Cached', 0)
 
-            # fast forward to next line
-            while cursor < n and self._mem_buf[cursor] != 10:
-                cursor += 1
-            cursor += 1
+        if mem_available is None:
+            # MemAvailable is absent on older kernels and some procfs-like
+            # mounts. Estimate it from the fields that are available instead
+            # of turning a missing field into a false 100% memory alarm.
+            estimated = sum(value for value in (mem_free, buffers, cached)
+                            if value is not None)
+            mem_available = estimated if estimated else mem_total
+        if mem_total > 0:
+            mem_available = min(mem_total, max(0, mem_available))
 
-        self._last_mem_free = None if mem_free is None else mem_free * 1024
-        return mem_total * 1024, mem_available * 1024, swap_total * 1024, swap_free * 1024, buffers * 1024, cached * 1024
-
-    def _parse_mem_val(self, cursor, n):
-        # find the colon
-        while cursor < n and self._mem_buf[cursor] != 58:
-            cursor += 1
-        cursor += 1
-
-        current_val = 0
-        in_number = False
-
-        while cursor < n and self._mem_buf[cursor] != 10:
-            b = self._mem_buf[cursor]
-            if 48 <= b <= 57:
-                in_number = True
-                current_val = (current_val * 10) + (b - 48)
-            elif in_number and b == 32:
-                break
-            cursor += 1
-
-        return current_val
+        self._last_mem_free = mem_free
+        return mem_total, mem_available, swap_total, swap_free, buffers, cached

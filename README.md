@@ -4,6 +4,18 @@ Cooler btop is a terminal system monitor with an optional local, read-only web
 dashboard. The supported desktop package targets Fedora 44 and Nobara systems
 based on Fedora 44.
 
+## At a glance
+
+| Area | Capabilities |
+| --- | --- |
+| Terminal | Textual interface, process filtering, per-core views, and history graphs |
+| Telemetry | CPU, memory, storage, network, GPU, listening ports, and processes |
+| Local dashboard | Optional read-only web interface with JSON and server-sent events |
+| History | In-memory capture/replay and optional SQLite logging in daemon mode |
+| Packaging | Python CLI distribution, Fedora/Nobara 44 desktop RPM, and container workflow |
+
+Use the [desktop installation](#fedoranobara-44-desktop-installation) for the supported RPM, or see the [Python package](#cli-only-python-package) and [container](#container-daemon) options.
+
 ## Fedora/Nobara 44 Desktop Installation
 
 The first RPM is checksummed but unsigned. The v2.0.0 tag predates the current
@@ -113,3 +125,29 @@ VPN, or SSH tunnel before exposing it beyond a trusted local machine. Use
 `--privacy-mode` to replace process command arguments with process names, and
 `--log-retention N` to cap SQLite history at N rows. SQLite metric files are
 created owner-readable only (`0600`); keep their parent directory private too.
+
+## Development
+
+Use **Python 3.9 or newer** and an isolated virtual environment:
+
+```bash
+git clone https://github.com/l0ee/cooler-btop.git
+cd cooler-btop
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[test]'
+python -m cooler_btop
+```
+
+| Command | Purpose |
+| --- | --- |
+| `make test` | Run the unittest suite |
+| `make package-check` | Check packaging behavior |
+| `make coverage` | Measure coverage with the configured minimum |
+| `make distributions` | Build the wheel and source archive |
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and release guidance and [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+## License
+
+Released under the [MIT License](LICENSE).
